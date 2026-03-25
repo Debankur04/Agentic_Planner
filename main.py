@@ -1,49 +1,102 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from agent.agentic_workflow import GraphBuilder
-from utils.save_to_document import save_document
 from starlette.responses import JSONResponse
 import os
-import datetime
+
+from Schema import *
+from backend.supabase_client.auth import *
+from backend.supabase_client.db_operations import *
+from agent_file.agent.agentic_workflow import GraphBuilder
+
 from dotenv import load_dotenv
-from pydantic import BaseModel
 load_dotenv()
 
 app = FastAPI()
 
+# ------------------ INIT GRAPH ONCE ------------------ #
+graph_builder = GraphBuilder(model_provider="groq")
+react_app = graph_builder()
+
+# ------------------ CORS ------------------ #
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # set specific origins in prod
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-class QueryRequest(BaseModel):
-    question: str
 
-@app.post("/query")
-async def query_travel_agent(query:QueryRequest):
+# ------------------ AUTH ------------------ #
+
+@app.post('/signup', response_model=AuthResponse)
+async def signup_api(query: AuthRequest):
+    return signup(query.email, query.password)
+
+
+@app.post('/signin', response_model=AuthResponse)
+async def signin_api(query: AuthRequest):
+    return signin(query.email, query.password)
+
+
+@app.post('/signout', response_model=SimpleMessage)
+async def signout_api():
+    signout()
+    return {"message": "Signed out successfully"}
+
+
+# ------------------ CONVERSATIONS ------------------ #
+
+@app.post('/create_conversation', response_model=SimpleMessage)
+async def create_conversation_api(query: ConversationCreate):
+    convo_id = create_conversation(query.user_id, query.title)
+    return {"message": f"Conversation created with id {convo_id}"}
+
+
+@app.delete('/delete_conversation', response_model=SimpleMessage)
+async def delete_conversation_api(query: ConversationDelete):
+    delete_conversation(query.conversation_id)
+    return {"message": "Conversation deleted successfully"}
+
+
+# ------------------ MESSAGES ------------------ #
+
+@app.get('/see_message', response_model=MessageListResponse)
+async def see_message_api(conversation_id: str = Query(...)):
+    messages = see_message(conversation_id)
+    return {"messages": messages}
+
+
+# ------------------ AGENT QUERY ------------------ #
+
+@app.post("/query", response_model=QueryResponse)
+async def query_travel_agent(query: QueryRequest):
     try:
-        print(query)
-        graph = GraphBuilder(model_provider="groq")
-        react_app=graph()
-        #react_app = graph.build_graph()
+        # Save user message
+        add_message(
+            user_id=query.user_id,
+            conversation_id=query.conversation_id,
+            role='user',
+            content=query.question
+        )
 
-        png_graph = react_app.get_graph().draw_mermaid_png()
-        with open("my_graph.png", "wb") as f:
-            f.write(png_graph)
-
-        print(f"Graph saved as 'my_graph.png' in {os.getcwd()}")
-        # Assuming request is a pydantic object like: {"question": "your text"}
-        messages={"messages": [query.question]}
+        # Run agent
+        messages = {"messages": [query.question]}
         output = react_app.invoke(messages)
 
-        # If result is dict with messages:
         if isinstance(output, dict) and "messages" in output:
-            final_output = output["messages"][-1].content  # Last AI response
+            final_output = output["messages"][-1].content
         else:
             final_output = str(output)
-        
+
+        # Save assistant response
+        add_message(
+            user_id=query.user_id,
+            conversation_id=query.conversation_id,
+            role='assistant',
+            content=final_output
+        )
+
         return {"answer": final_output}
+
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
