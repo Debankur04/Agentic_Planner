@@ -6,7 +6,7 @@ import os
 from Schema import *
 from backend.supabase_client.auth import *
 from backend.supabase_client.db_operations import *
-from agent_file.agent.agentic_workflow import GraphBuilder
+from agent_file.agent.agentic_workflow import AgentRunner, TravelEngine
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -14,8 +14,8 @@ load_dotenv()
 app = FastAPI()
 
 # ------------------ INIT GRAPH ONCE ------------------ #
-graph_builder = GraphBuilder(model_provider="groq")
-react_app = graph_builder()
+runner = AgentRunner()
+travel_engine = TravelEngine(runner)
 
 # ------------------ CORS ------------------ #
 app.add_middleware(
@@ -79,14 +79,20 @@ async def query_travel_agent(query: QueryRequest):
             content=query.question
         )
 
-        # Run agent
-        messages = {"messages": [query.question]}
-        output = react_app.invoke(messages)
+        # Get history from DB
+        past_messages = see_message(query.conversation_id)
+        history_str = ""
+        for msg in past_messages:
+            history_str += f"{msg['role']}: {msg['content']}\n"
 
-        if isinstance(output, dict) and "messages" in output:
-            final_output = output["messages"][-1].content
-        else:
-            final_output = str(output)
+        # Run agent
+        reply, pref, new_history = travel_engine.process_query(
+            user_input=query.question,
+            preference="",
+            history=history_str
+        )
+        
+        final_output = str(reply)
 
         # Save assistant response
         add_message(

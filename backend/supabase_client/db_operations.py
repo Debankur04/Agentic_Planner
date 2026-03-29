@@ -88,7 +88,6 @@ def create_conversation(user_id: str, title: str) -> str:
             raise RuntimeError('Conversation Creation Failed')
 
         return response.data[0]['id']
-
     except Exception as e:
         raise RuntimeError(f'[Conversation INSERT FAILED] {str(e)}') from e
 
