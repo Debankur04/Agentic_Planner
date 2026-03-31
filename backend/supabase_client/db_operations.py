@@ -1,5 +1,5 @@
 from typing import List, Dict
-from supabase_client.supabase_init import supabase_admin
+from backend.supabase_client.supabase_init import supabase_admin
 from datetime import datetime
 
 
@@ -119,7 +119,6 @@ def add_message(user_id: str, conversation_id: str, role: str, content: str) -> 
             supabase_admin
             .table('messages')
             .insert({
-                'user_id': user_id,
                 'conversation_id': conversation_id,
                 'role': role,
                 'content': content,
@@ -155,3 +154,75 @@ def see_message(conversation_id: str) -> List[Dict]:
 
     except Exception as e:
         raise RuntimeError(f"[FETCH MESSAGE FAILED] {str(e)}") from e
+    
+
+# ----------Preferences----------
+
+def add_preference(user_id: str, dietary_preference: dict, custom_preference: str = None):
+    try:
+        response = supabase_admin.table("preferences").insert({
+            "user_id": user_id,
+            "dietary_preference": dietary_preference,
+            "custom_preference": custom_preference
+        }).execute()
+
+        return {
+            "message": "Preference added successfully",
+            "data": response.data
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+    
+
+def update_preference(user_id: str, dietary_preference: dict = None, custom_preference: str = None):
+    try:
+        update_data = {}
+
+        if dietary_preference is not None:
+            update_data["dietary_preference"] = dietary_preference
+
+        if custom_preference is not None:
+            update_data["custom_preference"] = custom_preference
+
+        response = supabase_admin.table("preferences") \
+            .update(update_data) \
+            .eq("user_id", user_id) \
+            .execute()
+
+        return {
+            "message": "Preference updated successfully",
+            "data": response.data
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+    
+
+def delete_preference(user_id: str):
+    try:
+        response = supabase_admin.table("preferences") \
+            .delete() \
+            .eq("user_id", user_id) \
+            .execute()
+
+        return {
+            "message": "Preference deleted successfully",
+            "data": response.data
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+    
+
+def get_preference(user_id: str):
+    try:
+        response = supabase_admin.table("preferences") \
+            .select("*") \
+            .eq("user_id", user_id) \
+            .execute()
+
+        return response.data
+
+    except Exception as e:
+        return {"error": str(e)}

@@ -1,4 +1,4 @@
-from supabase_client.supabase_init import supabase_public
+from backend.supabase_client.supabase_init import supabase_public
 
 
 def signup(email: str, password: str):
@@ -10,10 +10,8 @@ def signup(email: str, password: str):
     )
 
     return {
-    "access_token": response.session.access_token,
-    "user_id": response.user.id 
-    }
-
+  "message": "Check your email to verify your account"
+}
 
 def signin(email: str, password: str):
     response =  supabase_public.auth.sign_in_with_password(

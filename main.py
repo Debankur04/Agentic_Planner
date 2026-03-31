@@ -2,7 +2,7 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 import os
-
+import json
 from Schema import *
 from backend.supabase_client.auth import *
 from backend.supabase_client.db_operations import *
@@ -26,9 +26,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.get('/')
+async def default():
+    return {'message':'Server started'}
+
 # ------------------ AUTH ------------------ #
 
-@app.post('/signup', response_model=AuthResponse)
+@app.post('/signup', response_model=SignupResponse)
 async def signup_api(query: AuthRequest):
     return signup(query.email, query.password)
 
@@ -85,10 +90,22 @@ async def query_travel_agent(query: QueryRequest):
         for msg in past_messages:
             history_str += f"{msg['role']}: {msg['content']}\n"
 
+        try:
+            pref_data = get_preference(query.user_id)
+            if pref_data and len(pref_data) > 0:
+                preference = json.dumps({
+                    "dietary": pref_data[0].get("dietary_preference"),
+                    "custom": pref_data[0].get("custom_preference")
+                })
+            else:
+                preference = ""
+        except:
+            preference = ""
+
         # Run agent
-        reply, pref, new_history = travel_engine.process_query(
+        reply, new_pref, new_history = travel_engine.process_query(
             user_input=query.question,
-            preference="",
+            preference=preference,
             history=history_str
         )
         
@@ -106,3 +123,17 @@ async def query_travel_agent(query: QueryRequest):
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+    
+
+
+# ------------------ PREFERENCES ------------------ #
+
+@app.post('add_preference')
+async def add_preference(query: AddPreferenceRequest)-> SimpleResponse:
+    response = add_preference(user_id = query.user_id, dietary_preference = query.dietary_preference, custom_preference = query.custom_preference)
+    return response
+
+@app.post('edit_preference')
+async def edit_preference(query: UpdatePreferenceRequest)-> SimpleResponse:
+    response = add_preference(user_id = query.user_id, dietary_preference = query.dietary_preference, custom_preference = query.custom_preference)
+    response

@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr
-from typing import Optional, List
+from typing import Optional, List, Dict
 from datetime import datetime
 
 
@@ -23,6 +23,8 @@ class AuthRequest(BaseModel):
     email: EmailStr
     password: str
 
+class SignupResponse(BaseModel):
+    message: str
 
 class AuthResponse(BaseModel):
     access_token: str
@@ -86,7 +88,6 @@ class MessageCreate(BaseModel):
 
 class MessageResponse(BaseModel):
     id: str
-    user_id: str
     conversation_id: str
     role: str
     content: str
@@ -97,3 +98,19 @@ class MessageRequest(BaseModel):
 
 class MessageListResponse(BaseModel):
     messages: List[MessageResponse]
+
+
+
+  # ------------------ PREFERENCES ------------------ #  
+class AddPreferenceRequest(BaseModel):
+    user_id: str
+    dietary_preference: Dict
+    custom_preference: Optional[str] = None 
+
+class UpdatePreferenceRequest(BaseModel):
+    user_id: str
+    dietary_preference: Optional[Dict] = None
+    custom_preference: Optional[str] = None
+
+class SimpleResponse(BaseModel):
+    message: str
