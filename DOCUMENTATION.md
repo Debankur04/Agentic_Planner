@@ -28,18 +28,25 @@ The project follows an advanced full-stack microservice architecture capable of 
 
 ---
 
-## 2. Agentic Workflow with Persistent Memory
+## 2. Agentic Workflow, Persistent Memory, & Scaling Decisions
 
-The LangGraph implementation (`agentic_workflow.py`) has been advanced to support persistent state and context retrieval.
+The central processing architecture (`agentic_workflow.py` and the main query pipeline) has been heavily refactored for scaling optimization and context precision:
 
-- **Class `GraphBuilder` Framework**: 
-  - **Memory Injection**: Before interpreting the current user input, the graph queries the user's database entry to retrieve their `Preference Context`. This context is seamlessly injected into the `SYSTEM_PROMPT` to guide output logic (e.g., dynamically prioritizing window seats or vegan-friendly restaurants).
-  - **State Maintenance**: Langgraph handles thread-level persistence, saving each step of the conversation into an underlying SQL/NoSQL storage so sessions can be resumed.
-  - **Workflow**: 
-    1. Retrieve User Context.
-    2. Route to Agent.
-    3. Loop through necessary custom Tools.
-    4. Compile Final Plan or Commit AP2 Command.
+### 2.1 Context Limits & Safety Bounds
+To avoid exponential token scaling issues and catastrophic memory blow-outs during long-running travel planning sessions, several explicit constraint decisions have been baked into the pipeline:
+- **Hard Window for Chat History**: Only the last 8 messages (`past_messages[-8:]`) are injected into the context trace per query. This isolates the LLM's operational attention strictly to the current conversational locus.
+- **Dedicated Memory Block**: Instead of relying solely on the chat history array, a serialized `memory` block tracks conversational facts. 
+- **Memory String Limits**: The overarching memory tracker string is aggressively truncated to retaining only the last 2,000 characters (`updated_memory[-2000:]`). This ensures that context sizes do not eventually overwhelm the inference token limits and guarantees reliable API operations.
+
+### 2.2 Framework & Graph Builder Options
+- **Memory Injection (Agentic Loop)**: The graph queries the database entry to retrieve an overarching `Preference JSON` and the newly updated running `memory` string. Both variables directly contextualize the `SYSTEM_PROMPT` allowing the groq-backed architecture to process "vegan-friendly" logic accurately without requiring parsing history.
+- **Decoupled API Schemas**: The backend explicitly separates `Conversations` (Thread Headers/Titles) from `Messages` (Iterative content). State maintenance allows frontend UX patterns to easily swap contexts without reloading huge arrays.
+  
+- **Workflow Execution**: 
+  1. Retrieve explicit Contexts (Preferences + Memory Track + Last 8 Messages).
+  2. Synthesize Graph State and route to Language Agent.
+  3. Loop through tools logic securely.
+  4. Post Process: Return Response, update local memory block, and commit string updates back to Database (e.g., `update_conversation_memory`).
 
 ---
 

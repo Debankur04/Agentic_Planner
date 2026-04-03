@@ -17,8 +17,11 @@ This project utilizes cutting-edge AI technologies, leveraging **LangGraph** to 
 
 The system operates on an advanced multi-tier architecture:
 1. **Frontend (`Next.js`)**: A responsive UI utilizing React Server Components for optimal performance and secure session management. It connects exclusively via RESTful JSON APIs to the backend.
-2. **Backend (`main.py` - FastAPI & DB)**: A scalable server handling API requests, JWT/OAuth authentication, and database connections (e.g., PostgreSQL or MongoDB) for persisting user states and chat histories.
-3. **Agentic Workflow (`agent/agentic_workflow.py`)**: The brain of the application utilizing `LangGraph`. It processes the query using a combination of semantic search over the user's historical context DB and live tool integration (Weather, Place Search, Expense Calculation) before generating the final plan or executing AP2-compliant booking commands.
+2. **Backend (`main.py` - FastAPI & DB)**: A scalable server handling API requests, JWT/OAuth authentication, and database connections (e.g., PostgreSQL or MongoDB). It features decoupled resources for Threads (Conversations) vs. Messages. **For full API details, see [API_DOCUMENTATION.md](./API_DOCUMENTATION.md).**
+3. **Agentic Workflow (`agent/agentic_workflow.py`)**: The brain of the application utilizing `LangGraph`. 
+   - Uses strict **Context Trace Limits** (only the last 8 messages) to maintain token safety.
+   - Extracts and maintains a continuously running, string-based **Memory Track** (truncated at 2000 chars to avoid memory explosion), overriding relying entirely on large history arrays.
+   - Leverages live tool integration (Weather, Place Search, Expense Calculation) before generating the final plan or executing AP2-compliant commands.
 
 ## 🚀 Setup & Installation
 

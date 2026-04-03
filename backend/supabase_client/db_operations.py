@@ -71,6 +71,25 @@ def delete_preference(user_id: str) -> str:
 
 # ------------------ CONVERSATIONS ------------------ #
 
+def see_conversation(user_id:str):
+    try:
+        response = (
+            supabase_admin
+            .table('conversations')
+            .select("*")
+            .eq("user_id", user_id)
+            .order("created_at", desc=False)
+            .execute()
+        )
+
+        if response.data is None:
+            raise RuntimeError("Failed to fetch messages")
+
+        return response.data
+
+    except Exception as e:
+        raise RuntimeError(f"[FETCH MESSAGE FAILED] {str(e)}") from e
+
 def create_conversation(user_id: str, title: str) -> str:
     try:
         response = (
@@ -226,3 +245,57 @@ def get_preference(user_id: str):
 
     except Exception as e:
         return {"error": str(e)}
+    
+
+
+
+# add memory, get memory, update memory
+
+def get_conversation_memory(conversation_id: str):
+    try:
+        response = (
+            supabase_admin
+            .table("conversations")
+            .select("memory")
+            .eq("id", conversation_id)
+            .single()
+            .execute()
+        )
+
+        if not response.data:
+            return ""
+
+        return response.data.get("memory", "")
+
+    except Exception as e:
+        raise RuntimeError(f"[GET MEMORY FAILED] {str(e)}") from e
+    
+def update_conversation_memory(conversation_id: str, memory: str):
+    try:
+        response = (
+            supabase_admin
+            .table("conversations")
+            .update({"memory": memory})
+            .eq("id", conversation_id)
+            .execute()
+        )
+
+        return response.data
+
+    except Exception as e:
+        raise RuntimeError(f"[UPDATE MEMORY FAILED] {str(e)}") from e
+
+def add_conversation_memory(conversation_id: str, memory: str = ""):
+    try:
+        response = (
+            supabase_admin
+            .table("conversations")
+            .update({"memory": memory})
+            .eq("id", conversation_id)
+            .execute()
+        )
+
+        return response.data
+
+    except Exception as e:
+        raise RuntimeError(f"[ADD MEMORY FAILED] {str(e)}") from e

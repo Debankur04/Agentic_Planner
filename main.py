@@ -40,6 +40,7 @@ async def signup_api(query: AuthRequest):
 
 @app.post('/signin', response_model=AuthResponse)
 async def signin_api(query: AuthRequest):
+    print(query.email, query.password)
     return signin(query.email, query.password)
 
 
@@ -51,16 +52,21 @@ async def signout_api():
 
 # ------------------ CONVERSATIONS ------------------ #
 
-@app.post('/create_conversation', response_model=SimpleMessage)
+@app.post('/create_conversation', response_model=ConversationCreateResponse)
 async def create_conversation_api(query: ConversationCreate):
     convo_id = create_conversation(query.user_id, query.title)
-    return {"message": f"Conversation created with id {convo_id}"}
+    return {"conversation_id": convo_id}
 
 
 @app.delete('/delete_conversation', response_model=SimpleMessage)
 async def delete_conversation_api(query: ConversationDelete):
     delete_conversation(query.conversation_id)
     return {"message": "Conversation deleted successfully"}
+
+@app.get('/see_conversation', response_model= ConversationListResponse)
+async def see_conversation_api(user_id:str = Query(...)):
+    response = see_conversation(user_id)
+    return {"conversations": response}
 
 
 # ------------------ MESSAGES ------------------ #
@@ -76,7 +82,7 @@ async def see_message_api(conversation_id: str = Query(...)):
 @app.post("/query", response_model=QueryResponse)
 async def query_travel_agent(query: QueryRequest):
     try:
-        # Save user message
+        # 1. Save user message
         add_message(
             user_id=query.user_id,
             conversation_id=query.conversation_id,
@@ -84,15 +90,17 @@ async def query_travel_agent(query: QueryRequest):
             content=query.question
         )
 
-        # Get history from DB
+        # 2. Get recent history (OPTION: limit later)
         past_messages = see_message(query.conversation_id)
         history_str = ""
-        for msg in past_messages:
+
+        for msg in past_messages[-8:]:  # 🔥 limit history (important)
             history_str += f"{msg['role']}: {msg['content']}\n"
 
+        # 3. Get preference
         try:
             pref_data = get_preference(query.user_id)
-            if pref_data and len(pref_data) > 0:
+            if isinstance(pref_data, list) and len(pref_data) > 0:
                 preference = json.dumps({
                     "dietary": pref_data[0].get("dietary_preference"),
                     "custom": pref_data[0].get("custom_preference")
@@ -102,22 +110,42 @@ async def query_travel_agent(query: QueryRequest):
         except:
             preference = ""
 
-        # Run agent
+        # 4. 🔥 GET MEMORY
+        try:
+            memory = get_conversation_memory(query.conversation_id)
+        except:
+            memory = ""
+
+        # 5. 🔥 Run agent (with memory)
         reply, new_pref, new_history = travel_engine.process_query(
             user_input=query.question,
             preference=preference,
-            history=history_str
+            history=history_str,
+            memory=memory   # ✅ NEW
         )
-        
+
         final_output = str(reply)
 
-        # Save assistant response
+        # 6. Save assistant response
         add_message(
             user_id=query.user_id,
             conversation_id=query.conversation_id,
             role='assistant',
             content=final_output
         )
+
+        # 7. 🔥 UPDATE MEMORY (IMPORTANT)
+        try:
+            # Simple version (you can upgrade later)
+            updated_memory = f"{memory}\nUser: {query.question}\nAssistant: {final_output}"
+
+            # limit memory size
+            updated_memory = updated_memory[-2000:]  # prevent explosion
+
+            update_conversation_memory(query.conversation_id, updated_memory)
+
+        except Exception as e:
+            print("Memory update failed:", e)
 
         return {"answer": final_output}
 

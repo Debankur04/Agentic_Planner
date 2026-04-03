@@ -67,6 +67,8 @@ class ConversationCreate(BaseModel):
     user_id: str
     title: str
 
+class ConversationCreateResponse(BaseModel):
+    conversation_id: str
 
 class ConversationDelete(BaseModel):
     conversation_id: str
@@ -75,6 +77,18 @@ class ConversationDelete(BaseModel):
 class ConversationResponse(BaseModel):
     id: str
     user_id: str
+
+class ConversationResponse(BaseModel):
+    id: str
+    user_id: str
+    title: str
+    created_at: Optional[datetime]
+
+class ConversationRequest(BaseModel):
+    user_id: str
+
+class ConversationListResponse(BaseModel):
+    conversations: List[ConversationResponse]
 
 
 # ------------------ MESSAGES ------------------ #
