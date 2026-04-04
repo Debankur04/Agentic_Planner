@@ -128,3 +128,6 @@ class UpdatePreferenceRequest(BaseModel):
 
 class SimpleResponse(BaseModel):
     message: str
+
+class SeePreferenceRequest(BaseModel):
+    user_id: str

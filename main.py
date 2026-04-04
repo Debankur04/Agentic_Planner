@@ -156,12 +156,17 @@ async def query_travel_agent(query: QueryRequest):
 
 # ------------------ PREFERENCES ------------------ #
 
-@app.post('add_preference')
-async def add_preference(query: AddPreferenceRequest)-> SimpleResponse:
+@app.post('/add_preference')
+async def add_preference_api(query: AddPreferenceRequest)-> SimpleResponse:
     response = add_preference(user_id = query.user_id, dietary_preference = query.dietary_preference, custom_preference = query.custom_preference)
     return response
 
-@app.post('edit_preference')
-async def edit_preference(query: UpdatePreferenceRequest)-> SimpleResponse:
+@app.post('/see_preference')
+async def see_preference_api(query: SeePreferenceRequest):
+    response = get_preference(query.user_id)
+    return response
+
+@app.post('/edit_preference')
+async def edit_preference_api(query: UpdatePreferenceRequest)-> SimpleResponse:
     response = add_preference(user_id = query.user_id, dietary_preference = query.dietary_preference, custom_preference = query.custom_preference)
     response
