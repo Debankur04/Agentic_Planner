@@ -1,11 +1,16 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 import os
 import json
 from Schema import *
 from backend.supabase_client.auth import *
-from backend.supabase_client.db_operations import *
+from backend.supabase_client.db_operations import (
+    create_conversation, delete_conversation, see_conversation,
+    add_message, see_message,
+    upsert_preference, remove_preference, get_preference,
+    get_conversation_memory, update_conversation_memory
+)
 from agent_file.agent.agentic_workflow import AgentRunner, TravelEngine
 
 from dotenv import load_dotenv
@@ -156,17 +161,45 @@ async def query_travel_agent(query: QueryRequest):
 
 # ------------------ PREFERENCES ------------------ #
 
-@app.post('/add_preference')
-async def add_preference_api(query: AddPreferenceRequest)-> SimpleResponse:
-    response = add_preference(user_id = query.user_id, dietary_preference = query.dietary_preference, custom_preference = query.custom_preference)
-    return response
+@app.post('/add_preference', response_model=SimpleResponse)
+async def add_preference_api(query: AddPreferenceRequest):
+    try:
+        result = upsert_preference(
+            user_id=query.user_id,
+            dietary_preference=query.dietary_preference,
+            custom_preference=query.custom_preference
+        )
+        return {"message": result["message"]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post('/edit_preference', response_model=SimpleResponse)
+async def edit_preference_api(query: UpdatePreferenceRequest):
+    try:
+        result = upsert_preference(
+            user_id=query.user_id,
+            dietary_preference=query.dietary_preference,
+            custom_preference=query.custom_preference
+        )
+        return {"message": result["message"]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post('/see_preference')
 async def see_preference_api(query: SeePreferenceRequest):
-    response = get_preference(query.user_id)
-    return response
+    try:
+        data = get_preference(query.user_id)
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post('/edit_preference')
-async def edit_preference_api(query: UpdatePreferenceRequest)-> SimpleResponse:
-    response = add_preference(user_id = query.user_id, dietary_preference = query.dietary_preference, custom_preference = query.custom_preference)
-    response
+
+@app.delete('/delete_preference', response_model=SimpleResponse)
+async def delete_preference_api(query: DeletePreferenceRequest):
+    try:
+        result = remove_preference(query.user_id)
+        return {"message": result["message"]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

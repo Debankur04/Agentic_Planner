@@ -177,74 +177,60 @@ def see_message(conversation_id: str) -> List[Dict]:
 
 # ----------Preferences----------
 
-def add_preference(user_id: str, dietary_preference: dict, custom_preference: str = None):
+def upsert_preference(user_id: str, dietary_preference: dict, custom_preference: str = None):
+    """Single upsert function - handles both insert and update, avoiding duplicate key violations."""
     try:
-        response = supabase_admin.table("preferences").insert({
+        payload = {
             "user_id": user_id,
             "dietary_preference": dietary_preference,
-            "custom_preference": custom_preference
-        }).execute()
-
-        return {
-            "message": "Preference added successfully",
-            "data": response.data
+            "custom_preference": custom_preference,
+            "updated_at": datetime.utcnow().isoformat()
         }
-
-    except Exception as e:
-        return {"error": str(e)}
-    
-
-def update_preference(user_id: str, dietary_preference: dict = None, custom_preference: str = None):
-    try:
-        update_data = {}
-
-        if dietary_preference is not None:
-            update_data["dietary_preference"] = dietary_preference
-
-        if custom_preference is not None:
-            update_data["custom_preference"] = custom_preference
-
-        response = supabase_admin.table("preferences") \
-            .update(update_data) \
-            .eq("user_id", user_id) \
+        response = (
+            supabase_admin
+            .table("preferences")
+            .upsert(payload, on_conflict="user_id")
             .execute()
+        )
 
-        return {
-            "message": "Preference updated successfully",
-            "data": response.data
-        }
+        if not response.data:
+            raise RuntimeError("Upsert returned empty response")
+
+        return {"message": "Preferences saved successfully", "data": response.data}
 
     except Exception as e:
-        return {"error": str(e)}
-    
+        raise RuntimeError(f"[PREFERENCE UPSERT FAILED] {str(e)}") from e
 
-def delete_preference(user_id: str):
+
+def remove_preference(user_id: str):
+    """Delete all preferences for a given user."""
     try:
-        response = supabase_admin.table("preferences") \
-            .delete() \
-            .eq("user_id", user_id) \
+        response = (
+            supabase_admin
+            .table("preferences")
+            .delete()
+            .eq("user_id", user_id)
             .execute()
-
-        return {
-            "message": "Preference deleted successfully",
-            "data": response.data
-        }
+        )
+        return {"message": "Preference deleted successfully"}
 
     except Exception as e:
-        return {"error": str(e)}
-    
+        raise RuntimeError(f"[PREFERENCE DELETE FAILED] {str(e)}") from e
+
 
 def get_preference(user_id: str):
     try:
-        response = supabase_admin.table("preferences") \
-            .select("*") \
-            .eq("user_id", user_id) \
+        response = (
+            supabase_admin
+            .table("preferences")
+            .select("*")
+            .eq("user_id", user_id)
             .execute()
-
-        return response.data
+        )
+        return response.data or []
 
     except Exception as e:
-        return {"error": str(e)}
+        raise RuntimeError(f"[PREFERENCE FETCH FAILED] {str(e)}") from e
     
 
 

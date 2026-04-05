@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 
@@ -118,13 +118,16 @@ class MessageListResponse(BaseModel):
   # ------------------ PREFERENCES ------------------ #  
 class AddPreferenceRequest(BaseModel):
     user_id: str
-    dietary_preference: Dict
-    custom_preference: Optional[str] = None 
+    dietary_preference: Dict[str, Any] = {}
+    custom_preference: Optional[str] = ""
 
 class UpdatePreferenceRequest(BaseModel):
     user_id: str
-    dietary_preference: Optional[Dict] = None
-    custom_preference: Optional[str] = None
+    dietary_preference: Dict[str, Any] = {}
+    custom_preference: Optional[str] = ""
+
+class DeletePreferenceRequest(BaseModel):
+    user_id: str
 
 class SimpleResponse(BaseModel):
     message: str
