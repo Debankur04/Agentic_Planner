@@ -1,7 +1,7 @@
 # 📋 System Requirement Document (SRD)
 
 **Project Name**: AI Travel Planner (Agentic Planner)
-**Version**: 2.0 (Advanced Multi-User Architecture)
+**Version**: MVP (Advanced Multi-User Architecture)
 
 ## 1. Introduction
 The next-generation AI Travel Planner is a sophisticated travel assistant merging autonomous agent logic with secure, scalable web development standards. It aims to not only generate custom trip itineraries but uniquely personalize those itineraries based on long-term user memory and assist in actionable travel bookings autonomously via standardized HTTP protocols.
