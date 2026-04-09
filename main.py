@@ -2,6 +2,7 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 import os
+import tiktoken
 import json
 from Schema import *
 from backend.supabase_client.auth import *
@@ -11,6 +12,8 @@ from backend.supabase_client.db_operations import (
     upsert_preference, remove_preference, get_preference,
     get_conversation_memory, update_conversation_memory
 )
+from llmops.guardrails import *
+from llmops.token_tracker import TokenTracker
 from agent_file.agent.agentic_workflow import AgentRunner, TravelEngine
 
 from dotenv import load_dotenv
@@ -18,9 +21,13 @@ load_dotenv()
 
 app = FastAPI()
 
+encoding = tiktoken.encoding_for_model("gpt-4")
+
 # ------------------ INIT GRAPH ONCE ------------------ #
 runner = AgentRunner()
 travel_engine = TravelEngine(runner)
+
+token_tracker = TokenTracker()
 
 # ------------------ CORS ------------------ #
 app.add_middleware(
@@ -87,14 +94,19 @@ async def see_message_api(conversation_id: str = Query(...)):
 @app.post("/query", response_model=QueryResponse)
 async def query_travel_agent(query: QueryRequest):
     try:
+        if not token_tracker.check_budget(user_id= query.user_id):
+            return {'message': 'Daily Limit Exceeded. Try again tomorrow.'}
+
+        user_query, violation = sanitize_input(query.question)
+        if violation:
+            return {'message': 'Message violation detected'}
         # 1. Save user message
         add_message(
             user_id=query.user_id,
             conversation_id=query.conversation_id,
             role='user',
-            content=query.question
+            content=user_query
         )
-
         # 2. Get recent history (OPTION: limit later)
         past_messages = see_message(query.conversation_id)
         history_str = ""
@@ -123,11 +135,13 @@ async def query_travel_agent(query: QueryRequest):
 
         # 5. 🔥 Run agent (with memory)
         reply, new_pref, new_history = travel_engine.process_query(
-            user_input=query.question,
+            user_input=user_query,
             preference=preference,
             history=history_str,
-            memory=memory   # ✅ NEW
+            memory=memory,   # ✅ NEW
+            user_id=query.user_id
         )
+        reply = validate_llm_output(reply)
 
         final_output = str(reply)
 
@@ -139,10 +153,14 @@ async def query_travel_agent(query: QueryRequest):
             content=final_output
         )
 
+        # input_tokens = len(tokenizer.encode(prompt))
+
+        # output_tokens = len(tokenizer.encode(response_text))
+
         # 7. 🔥 UPDATE MEMORY (IMPORTANT)
         try:
             # Simple version (you can upgrade later)
-            updated_memory = f"{memory}\nUser: {query.question}\nAssistant: {final_output}"
+            updated_memory = f"{memory}\nUser: {user_query}\nAssistant: {final_output}"
 
             # limit memory size
             updated_memory = updated_memory[-2000:]  # prevent explosion

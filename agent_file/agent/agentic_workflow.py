@@ -1,17 +1,27 @@
 from langchain_core.messages import SystemMessage, ToolMessage, HumanMessage
 import json
 from langgraph.graph import StateGraph, MessagesState, END, START
-
+from llmops.token_tracker import *
 from agent_file.utils.model_loader import load_llm, load_summarizier_llm
 from agent_file.prompt_library.prompt import SYSTEM_PROMPT
 from agent_file.prompt_library.prompt_maker import *
-
+from fastapi import HTTPException
 # ✅ Tools
 from agent_file.tools.flight_search import get_flight_search_tool
 from agent_file.tools.hotel_search import get_hotel_search_tool
 from agent_file.tools.place_search_tool import get_place_search_tools
 from agent_file.tools.weather_info_tool import get_weather_tools
+import concurrent.futures
 
+def run_with_timeout(app, input_data):
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future = executor.submit(app.invoke, input_data)
+        try:
+            return future.result(timeout=30)
+        except concurrent.futures.TimeoutError:
+            raise HTTPException(408, detail="Request timeout (30s)")
+
+token_tracker = TokenTracker()
 
 class GraphBuilder:
     def __init__(self):
@@ -45,6 +55,7 @@ class GraphBuilder:
         preference = state.get("preference", "")
         history = state.get("history", "")
         memory = state.get("memory", "")
+        user_id = state.get("user_id", "")
 
         # ✅ Only inject system prompt ONCE
         if not any(isinstance(m, SystemMessage) for m in messages):
@@ -57,7 +68,26 @@ class GraphBuilder:
             )
             messages = prompt_messages + messages
 
+        if not token_tracker.check_budget(user_id, user_tier='free'):
+            raise HTTPException(429, detail={
+            "error": "daily_budget_exceeded",
+            "message": "You've reached your daily AI usage limit. Upgrade to continue.",
+            "reset_at": "midnight UTC"
+        })
+
         response = self.llm_with_tools.invoke(messages)
+
+        model = self.llm.model_name if hasattr(self.llm, "model_name") else "unknown"
+        usage_data = getattr(response, "usage", None)
+
+        if usage_data:
+            usage = TokenUsage(
+            input_tokens=usage_data.prompt_tokens,
+            output_tokens=usage_data.completion_tokens,
+            model=model  # or dynamically from config
+        )
+
+            token_tracker.record_usage(user_id, usage)
 
         print("\n🧠 LLM RESPONSE:", response)
         print("🛠 TOOL CALLS:", getattr(response, "tool_calls", None))
@@ -70,7 +100,6 @@ class GraphBuilder:
     def tool_node(self, state: MessagesState):
         last_message = state["messages"][-1]
         outputs = []
-
         if hasattr(last_message, "tool_calls") and last_message.tool_calls:
             for tool_call in last_message.tool_calls:
                 tool_name = tool_call["name"]
@@ -160,12 +189,13 @@ class AgentRunner:
         self.app = agent.build()
         self.summary_llm = load_summarizier_llm()
 
-    def run_agent(self, user_input, preference="", history="", memory=""):
-        output = self.app.invoke({
+    def run_agent(self, user_input, preference="", history="", memory="",user_id=''):
+        output = run_with_timeout(self.app, {
             "messages": [HumanMessage(content=user_input)],
             "preference": preference,
             "history": history,
-            "memory": memory
+            "memory": memory,
+            "user_id": user_id
         })
         return output
 
@@ -176,11 +206,13 @@ class AgentRunner:
 
 
 class TravelEngine:
-    def __init__(self, agent_runner):
+    def __init__(self, agent_runner: AgentRunner):
         self.agent_runner = agent_runner
 
-    def process_query(self, user_input, preference="", history="", memory=""):
-        output = self.agent_runner.run_agent(user_input, preference, history, memory)
+    def process_query(self, user_input, preference="", history="", memory="", user_id =""):
+        if not user_id:
+            raise ValueError("user_id required")
+        output = self.agent_runner.run_agent(user_input, preference, history, memory,user_id)
 
         # ✅ FIX: get last AI message (not tool message)
         response = None
