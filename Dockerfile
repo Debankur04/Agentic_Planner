@@ -21,6 +21,6 @@ COPY . .
 
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
-EXPOSE 8000
+EXPOSE 10000
 
-CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD sh -c "uv run uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}"

@@ -2,16 +2,25 @@ from langchain_core.messages import SystemMessage, ToolMessage, HumanMessage
 import json
 from langgraph.graph import StateGraph, MessagesState, END, START
 from llmops.token_tracker import *
-from agent_file.utils.model_loader import load_llm, load_summarizier_llm
+from agent_file.utils.model_loader import load_summarizier_llm
 from agent_file.prompt_library.prompt import SYSTEM_PROMPT
 from agent_file.prompt_library.prompt_maker import *
 from fastapi import HTTPException
+import time
 # ✅ Tools
 from agent_file.tools.flight_search import get_flight_search_tool
 from agent_file.tools.hotel_search import get_hotel_search_tool
 from agent_file.tools.place_search_tool import get_place_search_tools
 from agent_file.tools.weather_info_tool import get_weather_tools
+from service.cache_service import *
+import redis
+import os
 import concurrent.futures
+
+redis_host = os.getenv("REDIS_HOST", "localhost")
+redis_port = int(os.getenv("REDIS_PORT", 6379))
+
+redis_client = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
 
 def run_with_timeout(app, input_data):
     with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -21,11 +30,11 @@ def run_with_timeout(app, input_data):
         except concurrent.futures.TimeoutError:
             raise HTTPException(408, detail="Request timeout (30s)")
 
-token_tracker = TokenTracker()
+token_tracker = TokenTracker(redis_client=redis_client)
 
 class GraphBuilder:
-    def __init__(self):
-        self.llm = load_llm()
+    def __init__(self, router):
+        self.router = router
 
         search_attractions, search_restaurants, search_activities, search_transportation = get_place_search_tools()
         find_flights = get_flight_search_tool()
@@ -42,8 +51,6 @@ class GraphBuilder:
             get_current_weather,
             get_weather_forecast
         ]
-
-        self.llm_with_tools = self.llm.bind_tools(self.tools)
         self.system_prompt = SYSTEM_PROMPT
         self.tool_map = {tool.name: tool for tool in self.tools}
 
@@ -75,9 +82,34 @@ class GraphBuilder:
             "reset_at": "midnight UTC"
         })
 
-        response = self.llm_with_tools.invoke(messages)
+        attempted = set()
 
-        model = self.llm.model_name if hasattr(self.llm, "model_name") else "unknown"
+        while True:
+            model_key = self.router.select_model(user_message)
+
+            if model_key in attempted:
+                raise HTTPException(500, "All models exhausted")
+
+            attempted.add(model_key)
+
+            try:
+                client = self.router.get_client(model_key)
+                llm = client.bind_tools(self.tools)
+
+                start = time.time()
+                response = llm.invoke(messages)
+                latency = (time.time() - start) * 1000
+
+                # ✅ SUCCESS TRACKING
+                self.router.record_success(model_key, latency)
+
+                break
+
+            except Exception as e:
+                # ❌ FAILURE TRACKING
+                self.router.record_failure(model_key, e)
+
+        model = self.router.config["models"][model_key]["model_name"] 
         usage_data = getattr(response, "usage", None)
 
         if usage_data:
@@ -101,6 +133,7 @@ class GraphBuilder:
         last_message = state["messages"][-1]
         outputs = []
         if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+
             for tool_call in last_message.tool_calls:
                 tool_name = tool_call["name"]
                 args = tool_call["args"]
@@ -108,18 +141,29 @@ class GraphBuilder:
                 print(f"\n🔥 EXECUTING TOOL: {tool_name}")
                 print(f"📦 ARGS: {args}")
 
-                if tool_name in self.tool_map:
-                    try:
-                        result = self.tool_map[tool_name].invoke(args)
+                cache_key = make_cache_key(tool_name, args)
+                cached = get_cache(cache_key)
 
-                        # ✅ FIX: handle API errors properly
-                        if isinstance(result, dict) and "error" in result:
-                            result = "Tool failed. Continue with available data."
-
-                    except Exception as e:
-                        result = f"Tool error: {str(e)}"
+                if cached:
+                    print(f"⚡ CACHE HIT: {tool_name}")
+                    result = cached
                 else:
-                    result = "Tool not found"
+                    print(f"🔥 CACHE MISS: {tool_name}")
+
+                    if tool_name in self.tool_map:
+                        try:
+                            result = self.tool_map[tool_name].invoke(args)
+
+                            # ✅ FIX: handle API errors properly
+                            if isinstance(result, dict) and "error" in result:
+                                result = "Tool failed. Continue with available data."
+                            else:
+                                set_cache(cache_key, result, ttl=300)
+
+                        except Exception as e:
+                            result = f"Tool error: {str(e)}"
+                    else:
+                        result = "Tool not found"
 
                 print(f"✅ RESULT: {result}")
 
@@ -184,9 +228,9 @@ class GraphBuilder:
 
 
 class AgentRunner:
-    def __init__(self):
-        agent = GraphBuilder()
-        self.app = agent.build()
+    def __init__(self, router):
+        agent = GraphBuilder(router)
+        self.app = agent.build()    
         self.summary_llm = load_summarizier_llm()
 
     def run_agent(self, user_input, preference="", history="", memory="",user_id=''):

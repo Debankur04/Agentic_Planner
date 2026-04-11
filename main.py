@@ -15,8 +15,10 @@ from backend.supabase_client.db_operations import (
 from llmops.guardrails import *
 from llmops.token_tracker import TokenTracker
 from agent_file.agent.agentic_workflow import AgentRunner, TravelEngine
-
+from llmops.model_router import ModelRouter
+from agent_file.utils.config_loader import load_config
 from dotenv import load_dotenv
+from service.cache_service import redis_client
 load_dotenv()
 
 app = FastAPI()
@@ -24,10 +26,10 @@ app = FastAPI()
 encoding = tiktoken.encoding_for_model("gpt-4")
 
 # ------------------ INIT GRAPH ONCE ------------------ #
-runner = AgentRunner()
+router = ModelRouter(load_config())
+runner = AgentRunner(router)
 travel_engine = TravelEngine(runner)
-
-token_tracker = TokenTracker()
+token_tracker = TokenTracker(redis_client= redis_client)
 
 # ------------------ CORS ------------------ #
 app.add_middleware(

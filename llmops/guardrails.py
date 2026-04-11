@@ -54,6 +54,28 @@ def sanitize_input(user_input: str) -> tuple[str, list[str]]:
 class OutputValidationError(Exception):
     pass
 
+def safe_json_parse(raw_output: str):
+    # Step 1: extract JSON block
+    match = re.search(r'\{.*\}', raw_output, re.DOTALL)
+    if not match:
+        raise ValueError("No JSON object found")
+
+    json_str = match.group()
+
+    # Step 2: fix invalid control characters INSIDE strings
+    def escape_control_chars(match):
+        content = match.group(0)
+        content = content.replace("\n", "\\n")
+        content = content.replace("\t", "\\t")
+        content = content.replace("\r", "\\r")
+        return content
+
+    # 🔥 only replace inside quoted strings
+    json_str = re.sub(r'"(.*?)"', escape_control_chars, json_str, flags=re.DOTALL)
+
+    # Step 3: parse safely
+    return json.loads(json_str)
+    
 def validate_llm_output(raw_output: str) -> dict:
     """
     1. Enforce JSON structure
@@ -62,15 +84,11 @@ def validate_llm_output(raw_output: str) -> dict:
     Returns validated content or raises OutputValidationError.
     """
     # Step 1: JSON parse
+    print(f'here your raw output: {raw_output}')
     try:
-        parsed = json.loads(raw_output)
-    except json.JSONDecodeError:
-        # Try to extract JSON block
-        match = re.search(r'\{.*\}', raw_output, re.DOTALL)
-        if match:
-            parsed = json.loads(match.group())
-        else:
-            raise OutputValidationError("Response is not valid JSON")
+        parsed = safe_json_parse(raw_output)
+    except Exception:
+        raise OutputValidationError("Response is not valid JSON")
 
     # Step 2: Required fields
     required = {"reply", "preference", "confidence"}
@@ -81,7 +99,7 @@ def validate_llm_output(raw_output: str) -> dict:
     # Step 3: Hallucination heuristics
     reply = parsed.get("reply", "")
     HALLUCINATION_SIGNALS = [
-        r"\$\d{3,}",            # Extremely specific dollar amounts without tool call
+        r"\$\d{4,}"   # only extremely large values       
         r"guaranteed price",
         r"confirmed booking",
         r"as of \d{4}",         # stale date claims
