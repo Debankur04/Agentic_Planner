@@ -28,7 +28,12 @@ class SignupResponse(BaseModel):
 
 class AuthResponse(BaseModel):
     access_token: str
+    refresh_token: str
     user_id: str
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
 
 
 class SignOutResponse(BaseModel):

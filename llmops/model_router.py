@@ -12,6 +12,7 @@ from enum import Enum
 from typing import Optional
 from langchain_groq import ChatGroq
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import SystemMessage, HumanMessage
 
 
 class ModelTier(Enum):
@@ -42,7 +43,7 @@ class ModelHealth:
         return sorted_lat[idx]
 
     def is_healthy(self) -> bool:
-        if self.total_calls < 10:
+        if self.total_calls < 30:
             return True
         if self.circuit_open:
             if time.time() > self.circuit_open_until:
@@ -77,15 +78,33 @@ class ModelRouter:
             self._clients[model_key] = self._build_client(model_key)
         return self._clients[model_key]
 
+    def _classify_intent(self, query: str) -> bool:
+        """Returns True if the query is a simple factual/greeting question, False if complex/reasoning."""
+        try:
+            # Use the cheapest/fastest model available
+            candidate = self.config["routing_rules"].get("simple_query_model", "fast")
+            client = self.get_client(candidate)
+            prompt = [
+                SystemMessage(content="You are an intent classifier. Return strictly 'True' if the user query is a simple factual question or greeting (e.g., asking for weather, definitions). Return strictly 'False' if it is a complex query requiring multi-step planning, reasoning, or external data processing (e.g., travel planning, complex searches). Output nothing else but True or False."),
+                HumanMessage(content=query)
+            ]
+            response = client.invoke(prompt)
+            result = response.content.strip().lower()
+            # Eliminate weird trailing punctuation or whitespace
+            return "true" in result
+        except Exception as e:
+            print(f"Classifier error: {e}")
+            return False
+
     def select_model(self, query: str, user_tier: str = "standard") -> str:
         """Route to cheapest healthy model that meets quality bar."""
         rules = self.config["routing_rules"]
 
-        # Simple query → fast model
-        if any(query.lower().startswith(k) for k in rules["simple_query_keywords"]):
-            candidate = rules["simple_query_model"]
-            if self.health[candidate].is_healthy():
-                return candidate
+        if rules.get("use_intent_classifier", False):
+            if self._classify_intent(query):
+                candidate = rules["simple_query_model"]
+                if self.health[candidate].is_healthy():
+                    return candidate
 
         # Walk the fallback chain
         for model_key in rules["fallback_chain"]:

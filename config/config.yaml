@@ -27,7 +27,7 @@ models:
     tier: cheap
 
 routing_rules:
-  simple_query_keywords: ['what', 'who', 'when', 'where', 'why', 'how']
+  use_intent_classifier: true
   simple_query_model: fast
   default_model: primary
   fallback_chain: [primary, fast, fallback]

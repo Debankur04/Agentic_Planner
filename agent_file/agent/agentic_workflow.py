@@ -16,11 +16,23 @@ from service.cache_service import *
 import redis
 import os
 import concurrent.futures
+from llmops.trace_service import ExecutionTrace
 
-redis_host = os.getenv("REDIS_HOST", "localhost")
-redis_port = int(os.getenv("REDIS_PORT", 6379))
+redis_url = os.getenv("REDIS_URL")
 
-redis_client = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+if redis_url:
+    # 🔥 Render / production
+    redis_client = redis.from_url(redis_url, decode_responses=True)
+else:
+    # 🧪 Local / docker-compose fallback
+    redis_host = os.getenv("REDIS_HOST", "localhost")
+    redis_port = int(os.getenv("REDIS_PORT", 6379))
+
+    redis_client = redis.Redis(
+        host=redis_host,
+        port=redis_port,
+        decode_responses=True
+    )
 
 def run_with_timeout(app, input_data):
     with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -63,6 +75,10 @@ class GraphBuilder:
         history = state.get("history", "")
         memory = state.get("memory", "")
         user_id = state.get("user_id", "")
+        trace = state.get("trace")
+
+        if trace:
+            trace.record("agent_node_start", {"model_selection": "pending"})
 
         # ✅ Only inject system prompt ONCE
         if not any(isinstance(m, SystemMessage) for m in messages):
@@ -102,12 +118,16 @@ class GraphBuilder:
 
                 # ✅ SUCCESS TRACKING
                 self.router.record_success(model_key, latency)
+                if trace:
+                    trace.record("llm_invoke_success", {"model": model_key}, latency_ms=latency)
 
                 break
 
             except Exception as e:
                 # ❌ FAILURE TRACKING
                 self.router.record_failure(model_key, e)
+                if trace:
+                    trace.record("llm_invoke_error", {"model": model_key, "error": str(e)})
 
         model = self.router.config["models"][model_key]["model_name"] 
         usage_data = getattr(response, "usage", None)
@@ -131,6 +151,7 @@ class GraphBuilder:
     # ------------------ TOOL NODE ------------------
     def tool_node(self, state: MessagesState):
         last_message = state["messages"][-1]
+        trace = state.get("trace")
         outputs = []
         if hasattr(last_message, "tool_calls") and last_message.tool_calls:
 
@@ -147,12 +168,19 @@ class GraphBuilder:
                 if cached:
                     print(f"⚡ CACHE HIT: {tool_name}")
                     result = cached
+                    if trace:
+                        trace.record("tool_cache_hit", {"tool": tool_name})
                 else:
                     print(f"🔥 CACHE MISS: {tool_name}")
 
                     if tool_name in self.tool_map:
                         try:
+                            t0 = time.time()
                             result = self.tool_map[tool_name].invoke(args)
+                            t1 = (time.time() - t0) * 1000
+
+                            if trace:
+                                trace.record("tool_invoke_success", {"tool": tool_name, "args": args}, latency_ms=t1)
 
                             # ✅ FIX: handle API errors properly
                             if isinstance(result, dict) and "error" in result:
@@ -162,6 +190,8 @@ class GraphBuilder:
 
                         except Exception as e:
                             result = f"Tool error: {str(e)}"
+                            if trace:
+                                trace.record("tool_invoke_error", {"tool": tool_name, "error": str(e)})
                     else:
                         result = "Tool not found"
 
@@ -234,14 +264,26 @@ class AgentRunner:
         self.summary_llm = load_summarizier_llm()
 
     def run_agent(self, user_input, preference="", history="", memory="",user_id=''):
-        output = run_with_timeout(self.app, {
-            "messages": [HumanMessage(content=user_input)],
-            "preference": preference,
-            "history": history,
-            "memory": memory,
-            "user_id": user_id
-        })
-        return output
+        trace = ExecutionTrace()
+        trace.record("run_agent_start", {"user_input": user_input})
+        t0 = time.time()
+        try:
+            output = run_with_timeout(self.app, {
+                "messages": [HumanMessage(content=user_input)],
+                "preference": preference,
+                "history": history,
+                "memory": memory,
+                "user_id": user_id,
+                "trace": trace
+            })
+            trace.record("run_agent_end", {"status": "success"}, latency_ms=(time.time()-t0)*1000)
+            return output
+        except Exception as e:
+            trace.record("run_agent_error", {"error": str(e)}, latency_ms=(time.time()-t0)*1000)
+            raise e
+        finally:
+            trace.save_to_db()
+            trace.save_to_redis(redis_client)
 
     def summary_agent(self, history: str, user_message: str):
         prompt = summarize_history(history=history, user_message=user_message)
