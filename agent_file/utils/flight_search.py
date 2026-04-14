@@ -9,9 +9,13 @@ class FlightSearchTool:
     """Tool to find flights between two locations"""
 
     def __init__(self):
-        self.client = serpapi.Client(
-            api_key=os.getenv("SERP_API_KEY")
-        )
+        api_key = os.getenv("SERP_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "SERP_API_KEY is not set. Add it to your .env file. "
+                "Get a key at https://serpapi.com"
+            )
+        self.client = serpapi.Client(api_key=api_key)
 
     def find_flights(
         self,
@@ -60,7 +64,14 @@ class FlightSearchTool:
                     "stops": len(segments) - 1
                 })
 
+            if not cleaned_results:
+                return {
+                    "message": "No flights found for the given route and date. "
+                               "Try different dates or check that departure_id and arrival_id "
+                               "are valid IATA airport codes (e.g. 'BOM', 'DEL', 'JFK')."
+                }
+
             return cleaned_results
 
         except Exception as e:
-            return {"error": str(e)}
+            return {"error": f"Flight search failed: {str(e)}"}

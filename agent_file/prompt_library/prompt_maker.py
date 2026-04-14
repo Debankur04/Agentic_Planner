@@ -56,12 +56,6 @@ Your job is to:
 - If no new info → retain previous memory
 
 ---
-STRICT RULES:
-1. Call tools ONLY when necessary.
-2. NEVER call the same tool repeatedly with the same arguments.
-3. If a tool fails, DO NOT retry endlessly — continue with available data.
-4. Once enough information is gathered, STOP calling tools.
-5. ALWAYS provide a FINAL ANSWER in natural language.
 
 ## Format (STRICT):
 
@@ -82,4 +76,48 @@ User Profile:
 {user_message}"""
     
     return prompt
-    
+
+def fallback_json(raw_output: str):
+    prompt = f"""
+You are a strict JSON formatter.
+
+Your job is to convert the given raw LLM output into VALID JSON.
+
+---
+
+## REQUIRED OUTPUT FORMAT (STRICT JSON ONLY):
+
+{{
+  "reply": "string (cleaned, user-facing response, at least 50 words)",
+  "preference": "short summary of extracted user preferences",
+  "confidence": float (0 to 1)
+}}
+
+---
+
+## RULES:
+
+1. OUTPUT ONLY JSON (no explanation, no markdown, no text before/after)
+2. Ensure valid JSON (double quotes, no trailing commas)
+3. "reply":
+   - Clean and rewrite the raw output into a helpful response
+   - Must be at least 50 words
+   - Remove broken formatting or partial sentences
+4. "preference":
+   - Extract any user preferences if present
+   - If none → return "None"
+5. "confidence":
+   - 0.9 if response is clear and complete
+   - 0.6 if partially usable
+   - 0.3 if very uncertain or messy
+
+---
+
+## INPUT RAW OUTPUT:
+{raw_output}
+
+---
+
+## OUTPUT:
+"""
+    return prompt

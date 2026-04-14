@@ -2,37 +2,21 @@ from langchain_core.messages import SystemMessage, ToolMessage, HumanMessage
 import json
 from langgraph.graph import StateGraph, MessagesState, END, START
 from llmops.token_tracker import *
-from agent_file.utils.model_loader import load_summarizier_llm
+from agent_file.utils.model_loader import *
 from agent_file.prompt_library.prompt import SYSTEM_PROMPT
 from agent_file.prompt_library.prompt_maker import *
 from fastapi import HTTPException
 import time
+
 # ✅ Tools
 from agent_file.tools.flight_search import get_flight_search_tool
 from agent_file.tools.hotel_search import get_hotel_search_tool
 from agent_file.tools.place_search_tool import get_place_search_tools
 from agent_file.tools.weather_info_tool import get_weather_tools
 from service.cache_service import *
-import redis
-import os
 import concurrent.futures
 from llmops.trace_service import ExecutionTrace
-
-redis_url = os.getenv("REDIS_URL")
-
-if redis_url:
-    # 🔥 Render / production
-    redis_client = redis.from_url(redis_url, decode_responses=True)
-else:
-    # 🧪 Local / docker-compose fallback
-    redis_host = os.getenv("REDIS_HOST", "localhost")
-    redis_port = int(os.getenv("REDIS_PORT", 6379))
-
-    redis_client = redis.Redis(
-        host=redis_host,
-        port=redis_port,
-        decode_responses=True
-    )
+from agent_file.prompt_library.prompt_maker import fallback_json
 
 def run_with_timeout(app, input_data):
     with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -106,25 +90,64 @@ class GraphBuilder:
             if model_key in attempted:
                 raise HTTPException(500, "All models exhausted")
 
+            # --- retry: log when we loop back after a failure ---
+            if attempted:
+                if trace:
+                    trace.record("llm_retry", {
+                        "retry_model": model_key,
+                        "already_tried": list(attempted)
+                    })
+
             attempted.add(model_key)
+
+            # 1. Model selected
+            if trace:
+                trace.record("model_selected", {
+                    "model_key": model_key,
+                    "model_name": self.router.config["models"][model_key]["model_name"],
+                    "provider": self.router.config["models"][model_key]["provider"]
+                })
 
             try:
                 client = self.router.get_client(model_key)
+
+                # 2. Client initialised
+                if trace:
+                    trace.record("client_initialized", {"model_key": model_key})
+
                 llm = client.bind_tools(self.tools)
+
+                # 3. Tools bound
+                if trace:
+                    trace.record("tools_bound", {
+                        "model_key": model_key,
+                        "tools": [t.name for t in self.tools]
+                    })
+
+                # 4. LLM invocation start
+                if trace:
+                    trace.record("llm_invoke_start", {
+                        "model_key": model_key,
+                        "message_count": len(messages)
+                    })
 
                 start = time.time()
                 response = llm.invoke(messages)
                 latency = (time.time() - start) * 1000
 
-                # ✅ SUCCESS TRACKING
+                # 5. LLM invocation success
                 self.router.record_success(model_key, latency)
                 if trace:
-                    trace.record("llm_invoke_success", {"model": model_key}, latency_ms=latency)
+                    trace.record("llm_invoke_success", {
+                        "model": model_key,
+                        "response_preview": str(getattr(response, "content", ""))[:200],
+                        "has_tool_calls": bool(getattr(response, "tool_calls", None))
+                    }, latency_ms=latency)
 
                 break
 
             except Exception as e:
-                # ❌ FAILURE TRACKING
+                # 6. LLM invocation error
                 self.router.record_failure(model_key, e)
                 if trace:
                     trace.record("llm_invoke_error", {"model": model_key, "error": str(e)})
@@ -162,6 +185,13 @@ class GraphBuilder:
                 print(f"\n🔥 EXECUTING TOOL: {tool_name}")
                 print(f"📦 ARGS: {args}")
 
+                # tool_called — before any execution
+                if trace:
+                    trace.record("tool_called", {
+                        "tool": tool_name,
+                        "args": str(args)[:300]   # truncate large payloads
+                    })
+
                 cache_key = make_cache_key(tool_name, args)
                 cached = get_cache(cache_key)
 
@@ -179,10 +209,14 @@ class GraphBuilder:
                             result = self.tool_map[tool_name].invoke(args)
                             t1 = (time.time() - t0) * 1000
 
+                            # tool_success — after successful execution
                             if trace:
-                                trace.record("tool_invoke_success", {"tool": tool_name, "args": args}, latency_ms=t1)
+                                trace.record("tool_success", {
+                                    "tool": tool_name,
+                                    "result_preview": str(result)[:200]
+                                }, latency_ms=t1)
 
-                            # ✅ FIX: handle API errors properly
+                            # handle API-level errors inside result
                             if isinstance(result, dict) and "error" in result:
                                 result = "Tool failed. Continue with available data."
                             else:
@@ -190,8 +224,12 @@ class GraphBuilder:
 
                         except Exception as e:
                             result = f"Tool error: {str(e)}"
+                            # tool_error — exception during execution
                             if trace:
-                                trace.record("tool_invoke_error", {"tool": tool_name, "error": str(e)})
+                                trace.record("tool_error", {
+                                    "tool": tool_name,
+                                    "error": str(e)
+                                })
                     else:
                         result = "Tool not found"
 
@@ -262,10 +300,13 @@ class AgentRunner:
         agent = GraphBuilder(router)
         self.app = agent.build()    
         self.summary_llm = load_summarizier_llm()
+        self.fallback_json_llm = load_fallback_to_json_llm()
 
-    def run_agent(self, user_input, preference="", history="", memory="",user_id=''):
-        trace = ExecutionTrace()
-        trace.record("run_agent_start", {"user_input": user_input})
+
+
+    def run_agent(self, user_input, preference="", history="", memory="", user_id='', request_id: str = None):
+        trace = ExecutionTrace(request_id=request_id)
+        trace.record("run_agent_start", {"user_input": user_input[:300], "user_id": user_id})
         t0 = time.time()
         try:
             output = run_with_timeout(self.app, {
@@ -276,6 +317,19 @@ class AgentRunner:
                 "user_id": user_id,
                 "trace": trace
             })
+
+            # Capture the final response for tracing
+            final_msg = None
+            for msg in reversed(output["messages"]):
+                if not isinstance(msg, ToolMessage):
+                    final_msg = msg
+                    break
+            trace.record(
+                "final_response",
+                {"response_preview": str(getattr(final_msg, "content", ""))[:200]},
+                latency_ms=(time.time() - t0) * 1000
+            )
+
             trace.record("run_agent_end", {"status": "success"}, latency_ms=(time.time()-t0)*1000)
             return output
         except Exception as e:
@@ -289,6 +343,11 @@ class AgentRunner:
         prompt = summarize_history(history=history, user_message=user_message)
         new_history = self.summary_llm.invoke(prompt)
         return new_history.content.strip()
+    
+    def fallback_json_agent(self, raw_input):
+        prompt = fallback_json(raw_output= raw_input)
+        fallback = self.fallback_json_llm.invoke(prompt)
+        return fallback
 
 
 class TravelEngine:

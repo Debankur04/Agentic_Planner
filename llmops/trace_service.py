@@ -35,8 +35,33 @@ class ExecutionTrace:
 
         def _safe_serialize(data):
             try:
-                return json.dumps(data)
-            except:
+                # ✅ Handle LangChain messages (AIMessage, HumanMessage, etc.)
+                if hasattr(data, "content"):
+                    return {
+                        "type": data.__class__.__name__,
+                        "content": data.content
+                    }
+
+                # ✅ Handle dict
+                if isinstance(data, dict):
+                    return {k: _safe_serialize(v) for k, v in data.items()}
+
+                # ✅ Handle list / tuple
+                if isinstance(data, (list, tuple)):
+                    return [_safe_serialize(v) for v in data]
+
+                # ✅ Handle primitive JSON-safe types
+                if isinstance(data, (str, int, float, bool)) or data is None:
+                    return data
+
+                # ✅ Handle objects with .dict() (Pydantic etc.)
+                if hasattr(data, "dict"):
+                    return data.dict()
+
+                # ✅ Fallback
+                return str(data)
+
+            except Exception:
                 return str(data)
         return {
             "request_id": self.request_id,
@@ -44,7 +69,7 @@ class ExecutionTrace:
             "step_count": self._step,
             "events": [
                 {"step": e.step, "type": e.event_type,
-                 "latency_ms": e.latency_ms, "data": _safe_serialize(e.data)[:500]}
+                 "latency_ms": e.latency_ms, "data": _safe_serialize(e.data)}
                 for e in self.events
             ]
         }
