@@ -51,6 +51,18 @@ def process_llm_output(raw_output: str):
     
 token_tracker = TokenTracker(redis_client= redis_client)
 
+import re
+
+def clean_llm_output(text: str) -> str:
+    # Remove anything that starts with <function=...>
+    text = re.sub(r"<function=.*?>.*?</function>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<function=.*?>", "", text)
+
+    # Clean up formatting
+    text = re.sub(r"\n\s*\n", "\n\n", text)
+
+    return text.strip()
+
 async def query_helper(query):
     # ── Trace bootstrap ──────────────────────────────────────────────────────
     request_id = f"req_{uuid.uuid4().hex}"
@@ -147,7 +159,7 @@ async def query_helper(query):
         # ── 8. Process / validate output ──────────────────────────────────────
         t_proc = time.time()
         reply = process_llm_output(reply)
-        final_output = reply
+        final_output = clean_llm_output(reply)
         trace.record("output_processed", {
             "final_reply_preview": str(final_output)[:200]
         }, latency_ms=(time.time()-t_proc)*1000)
@@ -156,7 +168,7 @@ async def query_helper(query):
         # Extract only the reply text — we do NOT store the full dict in the DB.
         # Storing a dict would cause Pydantic errors when /see_message tries to read it back.
         t_save = time.time()
-        reply_text = final_output.get('reply', str(final_output))
+        reply_text = final_output
         add_message(
             user_id=query.user_id,
             conversation_id=query.conversation_id,
@@ -179,7 +191,7 @@ async def query_helper(query):
         # ── 11. Final controller response trace ───────────────────────────────
         trace.record("final_response", {
             "request_id": request_id,
-            "answer_preview": str(final_output.get('reply', ''))[:200]
+            "answer_preview": str(final_output)
         }, latency_ms=(time.time()-t0)*1000)
 
         # Return just the reply string — the frontend reads data.reply
