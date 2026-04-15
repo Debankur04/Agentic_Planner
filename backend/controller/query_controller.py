@@ -153,12 +153,15 @@ async def query_helper(query):
         }, latency_ms=(time.time()-t_proc)*1000)
 
         # ── 9. Persist assistant response ─────────────────────────────────────
+        # Extract only the reply text — we do NOT store the full dict in the DB.
+        # Storing a dict would cause Pydantic errors when /see_message tries to read it back.
         t_save = time.time()
+        reply_text = final_output.get('reply', str(final_output))
         add_message(
             user_id=query.user_id,
             conversation_id=query.conversation_id,
             role='assistant',
-            content=final_output
+            content=reply_text  # Always a plain string
         )
         trace.record("db_assistant_message_saved", {}, latency_ms=(time.time()-t_save)*1000)
 
@@ -179,7 +182,8 @@ async def query_helper(query):
             "answer_preview": str(final_output.get('reply', ''))[:200]
         }, latency_ms=(time.time()-t0)*1000)
 
-        return {"answer": final_output['reply']}
+        # Return just the reply string — the frontend reads data.reply
+        return {"reply": reply_text}
 
     except Exception as e:
         trace.record("query_error", {

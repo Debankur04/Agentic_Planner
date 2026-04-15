@@ -73,42 +73,31 @@ def safe_json_parse(raw_output: str):
 
 
     
-def validate_llm_output(raw_output: str) -> dict:
+def validate_llm_output(raw_output: str) -> str:
     """
-    1. Enforce JSON structure
-    2. Detect hallucination signals
-    3. Length constraint check
-    Returns validated content or raises OutputValidationError.
+    Validate plain text LLM output.
     """
-    # Step 1: JSON parse
-    print(f'here your raw output: {raw_output}')
-    try:
-        parsed = safe_json_parse(raw_output)
-    except Exception:
-        raise OutputValidationError("Response is not valid JSON")
 
-    # Step 2: Required fields
-    required = {"reply", "preference", "confidence"}
-    missing = required - set(parsed.keys())
-    if missing:
-        raise OutputValidationError(f"Missing fields: {missing}")
+    if not isinstance(raw_output, str):
+        raise OutputValidationError("Output must be a string")
 
-    # Step 3: Hallucination heuristics
-    reply = parsed.get("reply", "")
-    HALLUCINATION_SIGNALS = [
-        r"\$\d{4,}",   # only extremely large values       
-        r"guaranteed price",
-        r"confirmed booking",
-        r"as of \d{4}",         # stale date claims
-    ]
-    for sig in HALLUCINATION_SIGNALS:
-        if re.search(sig, reply, re.IGNORECASE):
-            parsed["_hallucination_risk"] = True
-            break
+    reply = raw_output.strip()
 
-    # Step 4: Length guard (400–600 words)
+    # Length check
     word_count = len(reply.split())
     if word_count < 50:
         raise OutputValidationError(f"Reply too short: {word_count} words")
 
-    return parsed
+    # Optional: basic hallucination signals
+    HALLUCINATION_SIGNALS = [
+        r"\$\d{4,}",
+        r"guaranteed price",
+        r"confirmed booking",
+        r"as of \d{4}",
+    ]
+
+    for sig in HALLUCINATION_SIGNALS:
+        if re.search(sig, reply, re.IGNORECASE):
+            print("⚠️ Hallucination risk detected")
+
+    return reply

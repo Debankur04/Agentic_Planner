@@ -1,7 +1,7 @@
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List, Dict, Any
 from datetime import datetime
-
+from typing import Union
 
 # ------------------ COMMON ------------------ #
 
@@ -15,7 +15,7 @@ class SimpleMessage(BaseModel):
 
 
 class QueryResponse(BaseModel):
-    answer: str
+    reply: str  # The plain-text markdown reply from the AI agent
     
 # ------------------ AUTH ------------------ #
 
@@ -104,12 +104,13 @@ class MessageCreate(BaseModel):
     role: str  # "user" | "assistant"
     content: str
 
-
+# MessageContent is no longer needed — the controller now always stores
+# a plain string in the DB instead of a dict, so content is always str.
 class MessageResponse(BaseModel):
     id: str
     conversation_id: str
     role: str
-    content: str
+    content: str  # Always a plain string (markdown text)
     created_at: Optional[datetime]
 
 class MessageRequest(BaseModel):

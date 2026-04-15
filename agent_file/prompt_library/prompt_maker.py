@@ -79,41 +79,24 @@ User Profile:
 
 def fallback_json(raw_output: str):
     prompt = f"""
-You are a strict JSON formatter.
+You are a response cleaner.
 
-Your job is to convert the given raw LLM output into VALID JSON.
-
----
-
-## REQUIRED OUTPUT FORMAT (STRICT JSON ONLY):
-
-{{
-  "reply": "string (cleaned, user-facing response, at least 50 words)",
-  "preference": "short summary of extracted user preferences",
-  "confidence": float (0 to 1)
-}}
+Your job is to convert the given raw LLM output into a CLEAN, USER-FACING TEXT RESPONSE.
 
 ---
 
 ## RULES:
 
-1. OUTPUT ONLY JSON (no explanation, no markdown, no text before/after)
-2. Ensure valid JSON (double quotes, no trailing commas)
-3. "reply":
-   - Clean and rewrite the raw output into a helpful response
-   - Must be at least 50 words
-   - Remove broken formatting or partial sentences
-4. "preference":
-   - Extract any user preferences if present
-   - If none → return "None"
-5. "confidence":
-   - 0.9 if response is clear and complete
-   - 0.6 if partially usable
-   - 0.3 if very uncertain or messy
+1. OUTPUT ONLY plain text (NO JSON, NO markdown code blocks)
+2. Do NOT wrap in quotes
+3. Do NOT include keys like "reply"
+4. Minimum 50 words
+5. Fix grammar, remove broken formatting
+6. Make it clear and helpful
 
 ---
 
-## INPUT RAW OUTPUT:
+## INPUT:
 {raw_output}
 
 ---

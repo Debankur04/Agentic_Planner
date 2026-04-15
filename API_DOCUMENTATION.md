@@ -7,6 +7,14 @@ All endpoints are relative to the root URL (e.g., `http://localhost:8000`).
 
 ---
 
+## 0. System Health
+
+### `GET /health`
+Returns the operational status of the backend API, Redis connection, and detailed routing health metrics for all configured language models.
+*   **Response**: JSON object outlining system functionality, including granular stats per model (circuit statuses, latencies, etc).
+
+---
+
 ## 1. Authentication
 Endpoints for handling user registration and login.
 
@@ -30,7 +38,17 @@ Authenticates an existing user.
         "password": "securepassword123"
     }
     ```
-*   **Response (`AuthResponse`)**: returns access schema, typically including an `access_token` and `user_id`.
+*   **Response (`AuthResponse`)**: Returns `{"access_token": "...", "refresh_token": "...", "user_id": "..."}`.
+
+### `POST /refresh`
+Refreshes an access token using a valid refresh token.
+*   **Request Body (`RefreshRequest`)**:
+    ```json
+    {
+        "refresh_token": "string"
+    }
+    ```
+*   **Response (`AuthResponse`)**: Returns `{"access_token": "...", "refresh_token": "...", "user_id": "..."}`.
 
 ### `POST /signout`
 Ends the current user's authenticated session.
@@ -131,8 +149,6 @@ Performs an entire LangGraph execution pipeline: saving user prompts, extracting
 ## 5. Preferences
 Endpoints meant to manage dynamic user preferences.
 
-*(Note: There is an intentional bug in the code syntax `@app.post('add_preference')` without the preceding slash. Ensure to call the endpoint precisely as defined or correct the route source code to `/add_preference` and `/edit_preference`)*
-
 ### `POST /add_preference`
 Adds complex serialized preference strings to a user's DB.
 *   **Request Body (`AddPreferenceRequest`)**:
@@ -149,3 +165,33 @@ Adds complex serialized preference strings to a user's DB.
 Modifies the specified user preferences.
 *   **Request Body (`UpdatePreferenceRequest`)**: Same schema as add_preference.
 *   **Response (`SimpleResponse`)**: Success message.
+
+### `POST /see_preference`
+Retrieves a specific user's saved preferences.
+*   **Request Body (`SeePreferenceRequest`)**:
+    ```json
+    {
+        "user_id": "string"
+    }
+    ```
+*   **Response**: Dictionary of the database preference contents.
+
+### `DELETE /delete_preference`
+Clears a specified user's preference record.
+*   **Request Body (`DeletePreferenceRequest`)**:
+    ```json
+    {
+        "user_id": "string"
+    }
+    ```
+*   **Response (`SimpleResponse`)**: Success message.
+
+---
+
+## 6. Observability & Debugging
+
+### `GET /debug/trace/{request_id}`
+Retrieves the execution trace generated during a complex LLM query. Attempts to fetch from Redis Cache initially before falling back to MongoDB traces.
+*   **Path Parameters**:
+    *   `request_id` (string): The generated request trace ID.
+*   **Response**: Complex JSON dictionary outlining nested execution spans, latencies, agent state, and responses.
