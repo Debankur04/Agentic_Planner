@@ -22,9 +22,9 @@ The project follows an advanced full-stack microservice architecture capable of 
   - Chat session histories.
   - Individual preference vectors (flight preferences, loyalties, dietary restrictions).
 - **Endpoints**:
-  - `POST /auth/...`: Handles authentication workflows.
+  - `POST /signup`, `POST /signin`, `POST /refresh`: Handles authentication workflows.
   - `POST /query`: Primary endpoint processing authenticated user queries and triggering the agent.
-  - `GET /user/history`: Retrieves past generated itineraries or active bookings.
+  - `GET /see_conversation` & `GET /see_message`: Retrieves chat session histories.
 
 ---
 

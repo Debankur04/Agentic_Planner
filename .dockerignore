@@ -1,0 +1,40 @@
+# Git
+.git
+.gitignore
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.env
+.venv
+venv/
+
+# Node stuff (if monorepo)
+node_modules/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+
+# Docker
+Dockerfile
+docker-compose.yml
+
+# IDEs
+.vscode/
+.idea/
+
+# Testing / coverage
+.coverage
+htmlcov/
+
+# Misc
+*.sqlite3
+*.db
+.env.*

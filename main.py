@@ -1,26 +1,26 @@
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
-import os
 import json
 from Schema import *
 from backend.supabase_client.auth import *
 from backend.supabase_client.db_operations import (
-    create_conversation, delete_conversation, see_conversation,
-    add_message, see_message,
-    upsert_preference, remove_preference, get_preference,
-    get_conversation_memory, update_conversation_memory
-)
-from agent_file.agent.agentic_workflow import AgentRunner, TravelEngine
-
+    create_conversation, delete_conversation, see_conversation,see_message,
+    upsert_preference, remove_preference, get_preference)
+from llmops.guardrails import *
+from llmops.token_tracker import TokenTracker
 from dotenv import load_dotenv
+from service.cache_service import redis_client
+from service.verify_token import verify_token
+from backend.mongo import get_trace_from_db
+from backend.controller.query_controller import query_helper, router as query_router
+
 load_dotenv()
 
 app = FastAPI()
 
 # ------------------ INIT GRAPH ONCE ------------------ #
-runner = AgentRunner()
-travel_engine = TravelEngine(runner)
+token_tracker = TokenTracker(redis_client= redis_client)
 
 # ------------------ CORS ------------------ #
 app.add_middleware(
@@ -32,11 +32,47 @@ app.add_middleware(
 )
 
 
+# ------------------ APIS------------------ #
 @app.get('/')
 async def default():
     return {'message':'Server started'}
 
-# ------------------ AUTH ------------------ #
+@app.get('/health', tags=["System Health"])
+async def health_check():
+    status = {"backend": "active"}
+
+    # Check redis
+    try:
+        if redis_client.ping():
+            status["redis"] = "active"
+        else:
+            status["redis"] = "inactive"
+    except Exception as e:
+        status["redis"] = f"inactive: {str(e)}"
+
+    # Check models and pull all metrics
+    models_info = {}
+    for model_key, health_obj in query_router.health.items():
+        cfg = query_router.config["models"].get(model_key, {})
+        models_info[model_key] = {
+            "provider": cfg.get("provider"),
+            "model_name": cfg.get("model_name"),
+            "tier": cfg.get("tier"),
+            "cost_per_1k_input": cfg.get("cost_per_1k_input"),
+            "cost_per_1k_output": cfg.get("cost_per_1k_output"),
+            "avg_latency_ms": cfg.get("avg_latency_ms"),
+            "max_tokens": cfg.get("max_tokens"),
+            "error_count": health_obj.error_count,
+            "total_calls": health_obj.total_calls,
+            "error_rate": health_obj.error_rate,
+            "p99_latency": health_obj.p99_latency,
+            "circuit_open": health_obj.circuit_open,
+            "circuit_open_until": health_obj.circuit_open_until,
+            "is_healthy": health_obj.is_healthy()
+        }
+        
+    status["models"] = models_info
+    return status
 
 @app.post('/signup', response_model=SignupResponse)
 async def signup_api(query: AuthRequest):
@@ -49,6 +85,13 @@ async def signin_api(query: AuthRequest):
     return signin(query.email, query.password)
 
 
+@app.post('/refresh', response_model=AuthResponse)
+async def refresh_api(query: RefreshRequest):
+    try:
+        return refresh_session(query.refresh_token)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
 @app.post('/signout', response_model=SimpleMessage)
 async def signout_api():
     signout()
@@ -58,18 +101,18 @@ async def signout_api():
 # ------------------ CONVERSATIONS ------------------ #
 
 @app.post('/create_conversation', response_model=ConversationCreateResponse)
-async def create_conversation_api(query: ConversationCreate):
+async def create_conversation_api(query: ConversationCreate, user=Depends(verify_token)):
     convo_id = create_conversation(query.user_id, query.title)
     return {"conversation_id": convo_id}
 
 
 @app.delete('/delete_conversation', response_model=SimpleMessage)
-async def delete_conversation_api(query: ConversationDelete):
+async def delete_conversation_api(query: ConversationDelete, user=Depends(verify_token)):
     delete_conversation(query.conversation_id)
     return {"message": "Conversation deleted successfully"}
 
 @app.get('/see_conversation', response_model= ConversationListResponse)
-async def see_conversation_api(user_id:str = Query(...)):
+async def see_conversation_api(user_id:str = Query(...), user=Depends(verify_token)):
     response = see_conversation(user_id)
     return {"conversations": response}
 
@@ -77,7 +120,7 @@ async def see_conversation_api(user_id:str = Query(...)):
 # ------------------ MESSAGES ------------------ #
 
 @app.get('/see_message', response_model=MessageListResponse)
-async def see_message_api(conversation_id: str = Query(...)):
+async def see_message_api(conversation_id: str = Query(...), user=Depends(verify_token)):
     messages = see_message(conversation_id)
     return {"messages": messages}
 
@@ -85,84 +128,17 @@ async def see_message_api(conversation_id: str = Query(...)):
 # ------------------ AGENT QUERY ------------------ #
 
 @app.post("/query", response_model=QueryResponse)
-async def query_travel_agent(query: QueryRequest):
+async def query_travel_agent(query: QueryRequest, user=Depends(verify_token)):
     try:
-        # 1. Save user message
-        add_message(
-            user_id=query.user_id,
-            conversation_id=query.conversation_id,
-            role='user',
-            content=query.question
-        )
-
-        # 2. Get recent history (OPTION: limit later)
-        past_messages = see_message(query.conversation_id)
-        history_str = ""
-
-        for msg in past_messages[-8:]:  # 🔥 limit history (important)
-            history_str += f"{msg['role']}: {msg['content']}\n"
-
-        # 3. Get preference
-        try:
-            pref_data = get_preference(query.user_id)
-            if isinstance(pref_data, list) and len(pref_data) > 0:
-                preference = json.dumps({
-                    "dietary": pref_data[0].get("dietary_preference"),
-                    "custom": pref_data[0].get("custom_preference")
-                })
-            else:
-                preference = ""
-        except:
-            preference = ""
-
-        # 4. 🔥 GET MEMORY
-        try:
-            memory = get_conversation_memory(query.conversation_id)
-        except:
-            memory = ""
-
-        # 5. 🔥 Run agent (with memory)
-        reply, new_pref, new_history = travel_engine.process_query(
-            user_input=query.question,
-            preference=preference,
-            history=history_str,
-            memory=memory   # ✅ NEW
-        )
-
-        final_output = str(reply)
-
-        # 6. Save assistant response
-        add_message(
-            user_id=query.user_id,
-            conversation_id=query.conversation_id,
-            role='assistant',
-            content=final_output
-        )
-
-        # 7. 🔥 UPDATE MEMORY (IMPORTANT)
-        try:
-            # Simple version (you can upgrade later)
-            updated_memory = f"{memory}\nUser: {query.question}\nAssistant: {final_output}"
-
-            # limit memory size
-            updated_memory = updated_memory[-2000:]  # prevent explosion
-
-            update_conversation_memory(query.conversation_id, updated_memory)
-
-        except Exception as e:
-            print("Memory update failed:", e)
-
-        return {"answer": final_output}
-
+        return await query_helper(query)
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
     
 
-
 # ------------------ PREFERENCES ------------------ #
 
 @app.post('/add_preference', response_model=SimpleResponse)
-async def add_preference_api(query: AddPreferenceRequest):
+async def add_preference_api(query: AddPreferenceRequest, user=Depends(verify_token)):
     try:
         result = upsert_preference(
             user_id=query.user_id,
@@ -175,7 +151,7 @@ async def add_preference_api(query: AddPreferenceRequest):
 
 
 @app.post('/edit_preference', response_model=SimpleResponse)
-async def edit_preference_api(query: UpdatePreferenceRequest):
+async def edit_preference_api(query: UpdatePreferenceRequest, user=Depends(verify_token)):
     try:
         result = upsert_preference(
             user_id=query.user_id,
@@ -188,7 +164,7 @@ async def edit_preference_api(query: UpdatePreferenceRequest):
 
 
 @app.post('/see_preference')
-async def see_preference_api(query: SeePreferenceRequest):
+async def see_preference_api(query: SeePreferenceRequest, user=Depends(verify_token)):
     try:
         data = get_preference(query.user_id)
         return data
@@ -197,9 +173,31 @@ async def see_preference_api(query: SeePreferenceRequest):
 
 
 @app.delete('/delete_preference', response_model=SimpleResponse)
-async def delete_preference_api(query: DeletePreferenceRequest):
+async def delete_preference_api(query: DeletePreferenceRequest, user=Depends(verify_token)):
     try:
         result = remove_preference(query.user_id)
         return {"message": result["message"]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+
+@app.get("/debug/trace/{request_id}")
+async def get_trace(request_id: str):
+
+    # 🔥 1. Try Redis (fast path)
+    raw = redis_client.get(f"trace:{request_id}")
+    if raw:
+        return json.loads(raw)
+
+    # 🔥 2. Fallback to Mongo
+    trace = get_trace_from_db(request_id)
+
+    if not trace:
+        raise HTTPException(404, "Trace not found")
+
+    # 🔥 3. Remove Mongo ObjectId (not JSON serializable)
+    trace["_id"] = str(trace["_id"])
+
+    return trace
+
+
