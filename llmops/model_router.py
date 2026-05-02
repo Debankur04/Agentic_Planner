@@ -13,6 +13,7 @@ from typing import Optional
 from langchain_groq import ChatGroq
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage
+from backend.mongo import save_intent
 
 
 class ModelTier(Enum):
@@ -101,7 +102,9 @@ class ModelRouter:
         rules = self.config["routing_rules"]
 
         if rules.get("use_intent_classifier", False):
-            if self._classify_intent(query):
+            intent = self._classify_intent(query)
+            save_intent(query= query, intent= intent)
+            if intent:
                 candidate = rules["simple_query_model"]
                 if self.health[candidate].is_healthy():
                     return candidate
