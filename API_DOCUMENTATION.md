@@ -128,7 +128,10 @@ Retrieves past chat interactions from a specific conversation.
 The primary engine endpoint for the AI workflow.
 
 ### `POST /query`
-Performs an entire LangGraph execution pipeline: saving user prompts, extracting recent limited message history (last 8 limits), combining user preferences, fetching conversational memory blocks, tracking state, and committing agent outputs to memory limits.
+Performs an entire LangGraph execution pipeline: saving user prompts, extracting recent limited message history, combining user preferences, fetching conversational memory blocks, tracking state, and committing agent outputs.
+
+**Note:** This endpoint now supports **Server-Sent Events (SSE)** streaming and **Human-In-The-Loop (HITL)** interrupts. If the agent pauses to ask for clarification, it will stream the question. When the user replies with the same `conversation_id`, the agent resumes the graph exactly where it left off.
+
 *   **Request Body (`QueryRequest`)**:
     ```json
     {
@@ -137,12 +140,27 @@ Performs an entire LangGraph execution pipeline: saving user prompts, extracting
         "conversation_id": "string"
     }
     ```
-*   **Response (`QueryResponse`)**:
-    ```json
-    {
-        "answer": "The best time to visit Kyoto is..."
-    }
+*   **Response (`text/event-stream`)**:
+    Streams token chunks continuously until completion.
+    ```text
+    data: {"type": "chunk", "content": "The"}
+    
+    data: {"type": "chunk", "content": " best"}
+    
+    ...
+    
+    data: {"final_reply": "The best time to visit Kyoto is..."}
     ```
+    If an error or guardrail violation occurs, it streams:
+    ```text
+    data: {"error": "Message violation detected"}
+    ```
+
+### `GET /download_itinerary/{conversation_id}` (Planned Feature)
+Generates a downloadable Markdown or PDF format of the final generated itinerary.
+*   **Path Parameters**:
+    *   `conversation_id` (string): The unique conversation ID.
+*   **Response**: A `FileResponse` with the `text/markdown` or `application/pdf` MIME type.
 
 ---
 

@@ -48,6 +48,13 @@ To avoid exponential token scaling issues and catastrophic memory blow-outs duri
   3. Loop through tools logic securely.
   4. Post Process: Return Response, update local memory block, and commit string updates back to Database (e.g., `update_conversation_memory`).
 
+### 2.3 Human-in-the-Loop (HITL) & Real-Time Streaming
+- **Server-Sent Events (SSE)**: The query controller runs the LangGraph loop in an asynchronous background thread. A custom `QueueCallbackHandler` safely intercepts LLM tokens as they are generated and pushes them to an `asyncio.Queue`, allowing the FastAPI endpoint to stream the response character-by-character to the client for immediate UI feedback.
+- **Strict HITL Interrupts**: The workflow uses LangGraph `MemorySaver` to checkpoint execution state. When the LLM decides it is missing critical information, it invokes an `ask_human` tool.
+  - A conditional edge detects this tool call and forces an `interrupt_before` breakpoint, freezing the graph execution.
+  - The clarification question is streamed to the user, and the API request terminates (saving API costs and preventing hallucinations).
+  - When the user sends their answer (maintaining the same `conversation_id` thread), the graph is seamlessly resumed by converting the user's input into a `ToolMessage` and continuing the exact same execution state.
+
 ---
 
 ## 3. High-Level Tool Ecosystem & AP2 Integration
@@ -61,6 +68,15 @@ The agent integrates a suite of advanced tools, including booking automation mec
   - Leverages Google Places API and Tavily to source attractions and hotels.
 - **Math & Finance Tools**:
   - Expense calculations and currency conversions for cross-border pricing.
+
+### 3.1 Direct Booking Links (Planned Architecture)
+Generating deep-links for booking flights and hotels is complex because many generic search APIs do not return direct vendor links. 
+- **Implementation Strategy**: We will upgrade the `search_flight` tool to utilize SerpAPI's Google Flights engine (which returns `share_link` or deep booking URLs) and the `search_hotel` tool to extract official website URLs from Google Places. The system prompt will be updated to force the agent to inject these explicit URLs into the final Markdown itinerary instead of hallucinating links.
+
+### 3.2 Itinerary Export & Download (Planned Architecture)
+Allowing users to save and download their itineraries can be handled in two ways:
+- **Client-Side Rendering (Preferred)**: The Next.js frontend takes the raw Markdown string streamed from the `/query` endpoint and utilizes `html2pdf.js` to instantly generate a PDF on the user's browser without requiring backend processing.
+- **Backend API Generation**: Implementing a `GET /download_itinerary` endpoint that fetches the `conversation_id` history, retrieves the last Assistant message, processes it via a Python PDF library (e.g., `pdfkit`), and streams a `FileResponse` to the user.
 
 ---
 
