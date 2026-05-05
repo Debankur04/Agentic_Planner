@@ -8,6 +8,8 @@ This project utilizes cutting-edge AI technologies, leveraging **LangGraph** to 
 
 - **Personalized Itinerary Generation**: Day-by-day travel plans customized for standard tourists or those seeking off-beat locations.
 - **Context-Aware User Memory**: Maintains a long-term memory of individual user preferences from past interactions (e.g., flight seat preferences, favorite hotel chains, dietary restrictions) to tailor every new recommendation perfectly.
+- **Advanced Human-in-the-Loop (HITL)**: Utilizes strict LangGraph interrupts to pause execution when critical details are missing, requesting user clarification to prevent API token waste and hallucinations.
+- **Real-Time Streaming Output**: The `/query` API delivers responses using Server-Sent Events (SSE), streaming the agent's thoughts and final plan character-by-character for a highly responsive UI.
 - **Smart Booking Assistance & Action Capabilities**: The agent leverages different platform APIs alongside the **AP2 (Agent Protocol 2)** by Google to actively assist in booking flights, reserving restaurants, and securing hotel rooms securely.
 - **Multi-Tenant System & Authentication**: A complete multi-user system featuring secure authentication workflows, ensuring that every user's travel history, favorites, and billing details securely persist across sessions via a robust database.
 - **Support for Top-Tier LLMs**: Configurable to use Groq (`deepseek-r1-distill-llama-70b`) or OpenAI (`o4-mini`).

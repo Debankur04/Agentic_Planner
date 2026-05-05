@@ -124,12 +124,12 @@ class MessageListResponse(BaseModel):
   # ------------------ PREFERENCES ------------------ #  
 class AddPreferenceRequest(BaseModel):
     user_id: str
-    dietary_preference: Dict[str, Any] = {}
+    dietary_preference: Any = {}
     custom_preference: Optional[str] = ""
 
 class UpdatePreferenceRequest(BaseModel):
     user_id: str
-    dietary_preference: Dict[str, Any] = {}
+    dietary_preference: Any = {}
     custom_preference: Optional[str] = ""
 
 class DeletePreferenceRequest(BaseModel):

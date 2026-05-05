@@ -78,8 +78,7 @@ User Profile:
     return prompt
 
 def fallback_json(raw_output: str):
-    prompt = f"""
-You are a response cleaner.
+    system_prompt = """You are a response cleaner.
 
 Your job is to convert the given raw LLM output into a CLEAN, USER-FACING TEXT RESPONSE.
 
@@ -93,14 +92,8 @@ Your job is to convert the given raw LLM output into a CLEAN, USER-FACING TEXT R
 4. Minimum 50 words
 5. Fix grammar, remove broken formatting
 6. Make it clear and helpful
-
----
-
-## INPUT:
-{raw_output}
-
----
-
-## OUTPUT:
 """
-    return prompt
+    return [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=f"## INPUT:\n{raw_output}\n\n## OUTPUT:\n")
+    ]

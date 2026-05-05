@@ -1,6 +1,9 @@
 from langchain_core.messages import SystemMessage, ToolMessage, HumanMessage
 import json
 from langgraph.graph import StateGraph, MessagesState, END, START
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.tools import tool
+from langchain_core.messages import AIMessage
 from llmops.token_tracker import *
 from agent_file.utils.model_loader import *
 from agent_file.prompt_library.prompt import SYSTEM_PROMPT
@@ -13,14 +16,16 @@ from agent_file.tools.flight_search import get_flight_search_tool
 from agent_file.tools.hotel_search import get_hotel_search_tool
 from agent_file.tools.place_search_tool import get_place_search_tools
 from agent_file.tools.weather_info_tool import get_weather_tools
+from agent_file.tools.railway_search import get_railway_search_tool
+
 from service.cache_service import *
 import concurrent.futures
 from llmops.trace_service import ExecutionTrace
 from agent_file.prompt_library.prompt_maker import fallback_json
 
-def run_with_timeout(app, input_data):
+def run_with_timeout(app, input_data, config):
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        future = executor.submit(app.invoke, input_data)
+        future = executor.submit(app.invoke, input_data, config)
         try:
             return future.result(timeout=30)
         except concurrent.futures.TimeoutError:
@@ -36,6 +41,12 @@ class GraphBuilder:
         find_flights = get_flight_search_tool()
         search_hotel = get_hotel_search_tool()
         get_current_weather, get_weather_forecast = get_weather_tools()
+        find_routes, estimate_delay,live_train_update, get_schedule, get_code_station = get_railway_search_tool()
+
+        @tool
+        def ask_human(question: str) -> str:
+            """Ask the user a question to clarify missing critical information (e.g., travel dates, preferences, budget)."""
+            pass
 
         self.tools = [
             find_flights,
@@ -45,13 +56,20 @@ class GraphBuilder:
             search_activities,
             search_transportation,
             get_current_weather,
-            get_weather_forecast
+            get_weather_forecast,
+            find_routes,
+            estimate_delay,
+            live_train_update,
+            get_schedule,
+            get_code_station,
+            ask_human
         ]
         self.system_prompt = SYSTEM_PROMPT
         self.tool_map = {tool.name: tool for tool in self.tools}
 
     # ------------------ AGENT NODE ------------------
-    def agent_function(self, state: MessagesState):
+    def agent_function(self, state: MessagesState, config: dict = None):
+        config = config or {}
         messages = state["messages"]  # ✅ FIX: preserve full history
 
         user_message = messages[-1].content
@@ -59,7 +77,8 @@ class GraphBuilder:
         history = state.get("history", "")
         memory = state.get("memory", "")
         user_id = state.get("user_id", "")
-        trace = state.get("trace")
+        trace = config.get("configurable", {}).get("trace")
+        streaming_callback = config.get("configurable", {}).get("streaming_callback")
 
         if trace:
             trace.record("agent_node_start", {"model_selection": "pending"})
@@ -85,7 +104,10 @@ class GraphBuilder:
         attempted = set()
 
         while True:
-            model_key = self.router.select_model(user_message)
+            try:
+                model_key = self.router.select_model(user_message, exclude_models=attempted)
+            except RuntimeError:
+                raise HTTPException(500, "All models exhausted")
 
             if model_key in attempted:
                 raise HTTPException(500, "All models exhausted")
@@ -132,7 +154,12 @@ class GraphBuilder:
                     })
 
                 start = time.time()
-                response = llm.invoke(messages)
+                
+                invoke_kwargs = {}
+                if streaming_callback:
+                    invoke_kwargs["config"] = {"callbacks": [streaming_callback]}
+                    
+                response = llm.invoke(messages, **invoke_kwargs)
                 latency = (time.time() - start) * 1000
 
                 # 5. LLM invocation success
@@ -172,9 +199,10 @@ class GraphBuilder:
         }
 
     # ------------------ TOOL NODE ------------------
-    def tool_node(self, state: MessagesState):
+    def tool_node(self, state: MessagesState, config: dict = None):
+        config = config or {}
         last_message = state["messages"][-1]
-        trace = state.get("trace")
+        trace = config.get("configurable", {}).get("trace")
         outputs = []
         if hasattr(last_message, "tool_calls") and last_message.tool_calls:
 
@@ -246,6 +274,12 @@ class GraphBuilder:
             "messages": state["messages"] + outputs
         }
 
+    # ------------------ ASK HUMAN NODE ------------------
+    def ask_human_node(self, state: MessagesState):
+        # The graph pauses BEFORE this node.
+        # When resumed, the state is already updated with the user's answer (ToolMessage)
+        pass
+
     # ------------------ ROUTING ------------------
     def should_continue(self, state: MessagesState):
         messages = state["messages"]
@@ -255,8 +289,12 @@ class GraphBuilder:
         if not hasattr(last_message, "tool_calls") or not last_message.tool_calls:
             return "end"
 
+        # Route to ask_human_node if ask_human was called
+        if any(tc["name"] == "ask_human" for tc in last_message.tool_calls):
+            return "ask_human_node"
+
         # ✅ STOP infinite loops (max steps)
-        if len(messages) > 8:
+        if len(messages) > 15:
             print("⚠️ Max steps reached. Stopping loop.")
             return "end"
 
@@ -278,6 +316,7 @@ class GraphBuilder:
 
         graph.add_node("agent", self.agent_function)
         graph.add_node("tool", self.tool_node)
+        graph.add_node("ask_human_node", self.ask_human_node)
 
         graph.add_edge(START, "agent")
 
@@ -286,13 +325,16 @@ class GraphBuilder:
             self.should_continue,
             {
                 "tool": "tool",
+                "ask_human_node": "ask_human_node",
                 "end": END
             }
         )
 
         graph.add_edge("tool", "agent")
+        graph.add_edge("ask_human_node", "agent")
 
-        return graph.compile()
+        self.checkpointer = MemorySaver()
+        return graph.compile(checkpointer=self.checkpointer, interrupt_before=["ask_human_node"])
 
 
 class AgentRunner:
@@ -304,19 +346,56 @@ class AgentRunner:
 
 
 
-    def run_agent(self, user_input, preference="", history="", memory="", user_id='', request_id: str = None):
+    def run_agent(self, user_input, preference="", history="", memory="", user_id='', request_id: str = None, streaming_callback=None, conversation_id: str = None):
         trace = ExecutionTrace(request_id=request_id)
         trace.record("run_agent_start", {"user_input": user_input[:300], "user_id": user_id})
         t0 = time.time()
+        
+        config = {"configurable": {
+            "thread_id": conversation_id or "default",
+            "trace": trace,
+            "streaming_callback": streaming_callback
+        }}
+
         try:
-            output = run_with_timeout(self.app, {
-                "messages": [HumanMessage(content=user_input)],
-                "preference": preference,
-                "history": history,
-                "memory": memory,
-                "user_id": user_id,
-                "trace": trace
-            })
+            state = self.app.get_state(config)
+            
+            if state and state.next and "ask_human_node" in state.next:
+                # We are paused waiting for user input
+                last_msg = state.values["messages"][-1]
+                tool_call = next(tc for tc in last_msg.tool_calls if tc["name"] == "ask_human")
+                
+                tool_msg = ToolMessage(
+                    tool_call_id=tool_call["id"],
+                    name="ask_human",
+                    content=user_input
+                )
+                self.app.update_state(config, {"messages": [tool_msg]}, as_node="ask_human_node")
+                
+                output = run_with_timeout(self.app, None, config=config)
+            else:
+                output = run_with_timeout(self.app, {
+                    "messages": [HumanMessage(content=user_input)],
+                    "preference": preference,
+                    "history": history,
+                    "memory": memory,
+                    "user_id": user_id
+                }, config=config)
+
+            # Check if it paused again
+            state = self.app.get_state(config)
+            if state and state.next and "ask_human_node" in state.next:
+                # It just hit an interrupt, we need to return the question to the user
+                last_msg = state.values["messages"][-1]
+                tool_call = next(tc for tc in last_msg.tool_calls if tc["name"] == "ask_human")
+                question = tool_call["args"].get("question", "Could you provide more details?")
+                
+                # Stream the question directly to the frontend immediately
+                if streaming_callback and hasattr(streaming_callback, 'on_llm_new_token'):
+                    streaming_callback.on_llm_new_token(question)
+                    
+                # Append an AIMessage so the controller extracts the question correctly
+                output["messages"] = list(output["messages"]) + [AIMessage(content=question, additional_kwargs={"is_hitl": True})]
 
             # Capture the final response for tracing
             final_msg = None
@@ -354,17 +433,28 @@ class TravelEngine:
     def __init__(self, agent_runner: AgentRunner):
         self.agent_runner = agent_runner
 
-    def process_query(self, user_input, preference="", history="", memory="", user_id =""):
+    def process_query(self, user_input, preference="", history="", memory="", user_id ="", streaming_callback=None, conversation_id=""):
         if not user_id:
             raise ValueError("user_id required")
-        output = self.agent_runner.run_agent(user_input, preference, history, memory,user_id)
+        output = self.agent_runner.run_agent(user_input, preference, history, memory, user_id, streaming_callback=streaming_callback, conversation_id=conversation_id)
 
         # ✅ FIX: get last AI message (not tool message)
         response = None
+        is_hitl = False
         for msg in reversed(output["messages"]):
             if not isinstance(msg, ToolMessage):
                 response = msg.content
+                if hasattr(msg, "additional_kwargs") and msg.additional_kwargs.get("is_hitl"):
+                    is_hitl = True
+                
+                # Check if it was forcibly stopped without content but with tool calls
+                if not response and hasattr(msg, "tool_calls") and msg.tool_calls:
+                    response = "I've explored multiple options but couldn't finalize a complete itinerary within the search limit. Could you please provide more specific preferences (like exact dates or transport modes) so I can narrow down the search?"
                 break
+
+        if is_hitl:
+            # If asking a clarification question, STOP immediately, don't generate any further text
+            return response, preference, history, is_hitl
 
         content = self._parse_response(response)
 
@@ -372,16 +462,16 @@ class TravelEngine:
         pref = self._extract_preference(content)
 
         convo = f"""user query: 
-{user_input} 
-agent reply: 
-{reply}"""
+                {user_input} 
+                agent reply: 
+                {reply}"""
 
         if len(history) > 300:
             history = self._summarizier(history=history, user_message=convo)
         else:
             history += convo
 
-        return reply, pref, history
+        return reply, pref, history, is_hitl
 
     def _parse_response(self, response):
         try:

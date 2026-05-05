@@ -13,6 +13,7 @@ from typing import Optional
 from langchain_groq import ChatGroq
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage
+from backend.mongo import save_intent
 
 
 class ModelTier(Enum):
@@ -43,13 +44,13 @@ class ModelHealth:
         return sorted_lat[idx]
 
     def is_healthy(self) -> bool:
-        if self.total_calls < 30:
-            return True
         if self.circuit_open:
             if time.time() > self.circuit_open_until:
                 self.circuit_open = False   # half-open
                 return True
             return False
+        if self.total_calls < 30:
+            return True
         return self.error_rate < 0.05 and self.p99_latency < 3000
 
 
@@ -96,19 +97,22 @@ class ModelRouter:
             print(f"Classifier error: {e}")
             return False
 
-    def select_model(self, query: str, user_tier: str = "standard") -> str:
+    def select_model(self, query: str, user_tier: str = "standard", exclude_models: set = None) -> str:
         """Route to cheapest healthy model that meets quality bar."""
         rules = self.config["routing_rules"]
+        exclude_models = exclude_models or set()
 
         if rules.get("use_intent_classifier", False):
-            if self._classify_intent(query):
+            intent = self._classify_intent(query)
+            save_intent(query= query, intent= intent)
+            if intent:
                 candidate = rules["simple_query_model"]
-                if self.health[candidate].is_healthy():
+                if candidate not in exclude_models and self.health[candidate].is_healthy():
                     return candidate
 
         # Walk the fallback chain
         for model_key in rules["fallback_chain"]:
-            if self.health[model_key].is_healthy():
+            if model_key not in exclude_models and self.health[model_key].is_healthy():
                 return model_key
 
         raise RuntimeError("All models unhealthy — serving degraded response")
