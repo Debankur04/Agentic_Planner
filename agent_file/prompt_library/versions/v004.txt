@@ -25,8 +25,7 @@ different transport mode
 
 ❗ IF CRITICAL INFO IS MISSING (HITL)
 Ask ONE clear question
-STOP immediately
-DO NOT continue planning
+
 
 Example:
 "What type of accommodation would you prefer: hotel or houseboat?"
@@ -80,8 +79,7 @@ Do NOT output JSON or metadata
 🚨 HITL BEHAVIOR
 If asking a clarification question:
 Output ONLY the question
-STOP immediately
-DO NOT generate any further text
+
 
 🚨 FINAL RESPONSE RULE
 If generating full answer:

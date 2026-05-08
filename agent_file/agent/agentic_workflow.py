@@ -78,7 +78,6 @@ class GraphBuilder:
         memory = state.get("memory", "")
         user_id = state.get("user_id", "")
         trace = config.get("configurable", {}).get("trace")
-        streaming_callback = config.get("configurable", {}).get("streaming_callback")
 
         if trace:
             trace.record("agent_node_start", {"model_selection": "pending"})
@@ -155,11 +154,7 @@ class GraphBuilder:
 
                 start = time.time()
                 
-                invoke_kwargs = {}
-                if streaming_callback:
-                    invoke_kwargs["config"] = {"callbacks": [streaming_callback]}
-                    
-                response = llm.invoke(messages, **invoke_kwargs)
+                response = llm.invoke(messages)
                 latency = (time.time() - start) * 1000
 
                 # 5. LLM invocation success
@@ -346,15 +341,14 @@ class AgentRunner:
 
 
 
-    def run_agent(self, user_input, preference="", history="", memory="", user_id='', request_id: str = None, streaming_callback=None, conversation_id: str = None):
+    def run_agent(self, user_input, preference="", history="", memory="", user_id='', request_id: str = None, conversation_id: str = None):
         trace = ExecutionTrace(request_id=request_id)
         trace.record("run_agent_start", {"user_input": user_input[:300], "user_id": user_id})
         t0 = time.time()
         
         config = {"configurable": {
             "thread_id": conversation_id or "default",
-            "trace": trace,
-            "streaming_callback": streaming_callback
+            "trace": trace
         }}
 
         try:
@@ -389,10 +383,6 @@ class AgentRunner:
                 last_msg = state.values["messages"][-1]
                 tool_call = next(tc for tc in last_msg.tool_calls if tc["name"] == "ask_human")
                 question = tool_call["args"].get("question", "Could you provide more details?")
-                
-                # Stream the question directly to the frontend immediately
-                if streaming_callback and hasattr(streaming_callback, 'on_llm_new_token'):
-                    streaming_callback.on_llm_new_token(question)
                     
                 # Append an AIMessage so the controller extracts the question correctly
                 output["messages"] = list(output["messages"]) + [AIMessage(content=question, additional_kwargs={"is_hitl": True})]
@@ -433,10 +423,10 @@ class TravelEngine:
     def __init__(self, agent_runner: AgentRunner):
         self.agent_runner = agent_runner
 
-    def process_query(self, user_input, preference="", history="", memory="", user_id ="", streaming_callback=None, conversation_id=""):
+    def process_query(self, user_input, preference="", history="", memory="", user_id ="", conversation_id=""):
         if not user_id:
             raise ValueError("user_id required")
-        output = self.agent_runner.run_agent(user_input, preference, history, memory, user_id, streaming_callback=streaming_callback, conversation_id=conversation_id)
+        output = self.agent_runner.run_agent(user_input, preference, history, memory, user_id, conversation_id=conversation_id)
 
         # ✅ FIX: get last AI message (not tool message)
         response = None

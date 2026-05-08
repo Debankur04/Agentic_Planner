@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Query, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import JSONResponse, StreamingResponse
+from starlette.responses import JSONResponse
 from Schema import *
 from backend.supabase_client.auth import *
 from backend.supabase_client.db_operations import (
@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from service.cache_service import redis_client
 from service.verify_token import verify_token
 from backend.mongo import get_trace_from_db
-from backend.controller.query_controller import query_helper_stream, query_helper, router as query_router
+from backend.controller.query_controller import query_helper, router as query_router
 
 load_dotenv()
 
@@ -129,7 +129,8 @@ async def see_message_api(conversation_id: str = Query(...), user=Depends(verify
 @app.post("/query")
 async def query_travel_agent(query: QueryRequest, user=Depends(verify_token)):
     try:
-        return StreamingResponse(query_helper_stream(query), media_type="text/event-stream")
+        result = await query_helper(query)
+        return JSONResponse(content=result)
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
     
