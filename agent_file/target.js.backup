@@ -1,0 +1,110 @@
+/**
+ * Auto-generated multi-agent communication file
+ * DO NOT EDIT MANUALLY
+ */
+
+module.exports = {
+  "workflow_id": "",
+  "phase": "intake_validation",
+  "timestamp": null,
+  "intake_validation": {
+    "status": "completed",
+    "user_input": "",
+    "validation_results": {
+      "status": "needs_clarification",
+      "confidence": 80,
+      "extracted_requirements": {
+        "destination": "Japan",
+        "duration": "4 days",
+        "budget": "2lcs rs",
+        "transportation": "flight",
+        "accommodation": "basic"
+      },
+      "missing_information": [
+        "currency conversion (lcs to rs)",
+        "specific city or region in Japan"
+      ],
+      "concerns": [
+        "ambiguous budget range",
+        "unclear accommodation type"
+      ],
+      "initial_plan": {
+        "phase": "planning",
+        "estimated_steps": [
+          "Check flight prices from user's location to Japan",
+          "Research basic accommodation options in Japan (hotels, hostels, etc.)"
+        ],
+        "key_decisions": {
+          "transportation": "flight",
+          "accommodation": "basic"
+        }
+      },
+      "clarification_questions": [
+        "Can you please specify the currency (e.g., INR, USD) for the budget?",
+        "Which city or region in Japan are you interested in visiting?",
+        "Can you provide a more detailed budget breakdown (e.g., per day, specific expenses)?",
+        "What do you mean by 'basic' accommodation (e.g., price range, amenities)?"
+      ],
+      "reasoning": "The input is incomplete regarding the budget and accommodation. The user's location is also unknown, which affects flight prices. Specific city or region in Japan will impact accommodation options and overall plan.",
+      "trace_markers": {
+        "validation_rule_applied": [
+          "Extracted explicit requirements from user input",
+          "Identified missing critical information (currency conversion, specific city or region)",
+          "Flagged ambiguities (budget range, accommodation type)"
+        ],
+        "extraction_accuracy": "80%",
+        "ambiguities_detected": [
+          "budget range (2lcs rs)",
+          "accommodation type (basic)"
+        ]
+      }
+    },
+    "initial_plan": {
+      "phase": "planning",
+      "estimated_steps": [
+        "Check flight prices from user's location to Japan",
+        "Research basic accommodation options in Japan (hotels, hostels, etc.)"
+      ],
+      "key_decisions": {
+        "transportation": "flight",
+        "accommodation": "basic"
+      }
+    },
+    "user_clarifications_needed": [
+      "Can you please specify the currency (e.g., INR, USD) for the budget?",
+      "Which city or region in Japan are you interested in visiting?",
+      "Can you provide a more detailed budget breakdown (e.g., per day, specific expenses)?",
+      "What do you mean by 'basic' accommodation (e.g., price range, amenities)?"
+    ],
+    "hitl_response": null,
+    "timestamp": "2026-05-27T19:57:57.346189",
+    "trace_logs": []
+  },
+  "research_pricing": {
+    "status": "pending",
+    "plan_from_intake": {},
+    "research_results": {},
+    "pricing_data": {},
+    "recommendations": [],
+    "issues_found": [],
+    "timestamp": null,
+    "trace_logs": []
+  },
+  "writing": {
+    "status": "pending",
+    "research_data": {},
+    "final_output": "",
+    "formatting_applied": [],
+    "timestamp": null,
+    "trace_logs": []
+  },
+  "global_trace": [],
+  "metadata": {
+    "created_at": null,
+    "updated_at": "2026-05-27T19:57:57.347191",
+    "user_id": "",
+    "conversation_id": "",
+    "request_id": "",
+    "phase_sequence": []
+  }
+};

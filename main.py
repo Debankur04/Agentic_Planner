@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Query, HTTPException, Depends, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 from slowapi import Limiter
@@ -6,6 +7,8 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from Schema import *
+import logging
+import uuid
 from backend.supabase_client.auth import *
 from backend.supabase_client.db_operations import (
     create_conversation, delete_conversation, see_conversation,see_message,
@@ -22,6 +25,31 @@ load_dotenv()
 
 app = FastAPI()
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s [%(request_id)s] %(message)s",
+)
+logger = logging.getLogger("agentic_planner")
+
+
+def build_api_response(success: bool, data: dict | None = None, trace_id: str = "", errors: list[str] | None = None, warnings: list[str] | None = None):
+    return {
+        "success": success,
+        "data": data or {},
+        "trace_id": trace_id or "",
+        "errors": errors or [],
+        "warnings": warnings or []
+    }
+
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
 # ------------------ RATE LIMITING SETUP (SLOWAPI) ------------------ #
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -29,12 +57,15 @@ app.add_exception_handler(RateLimitExceeded, lambda request, exc: JSONResponse(
     status_code=429,
     content={"error": "Rate limit exceeded. Please try again later."}
 ))
-app.add_middleware(SlowAPIMiddleware)
 
 # ------------------ INIT GRAPH ONCE ------------------ #
 token_tracker = TokenTracker(redis_client= redis_client)
 
 # ------------------ CORS ------------------ #
+# Rate limiting middleware
+app.add_middleware(SlowAPIMiddleware)
+
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -42,6 +73,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception while processing request", exc_info=exc, extra={"request_id": getattr(request.state, "request_id", "")})
+    payload = build_api_response(
+        success=False,
+        data={},
+        trace_id=getattr(request.state, "request_id", ""),
+        errors=[str(exc)],
+        warnings=[]
+    )
+    return JSONResponse(status_code=500, content=jsonable_encoder(payload))
 
 
 # ------------------ APIS------------------ #
@@ -152,12 +196,36 @@ async def see_message_api(request: Request, conversation_id: str = Query(...), u
 @app.post("/query")
 @limiter.limit("30/minute")
 async def query_travel_agent(request: Request, query: QueryRequest, user=Depends(verify_token)):
-    try:
-        result = await query_helper(query)
-        return JSONResponse(content=result)
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-    
+    result = await query_helper(query)
+    trace_id = getattr(request.state, "request_id", "")
+
+    if isinstance(result, dict) and "error" in result:
+        errors = [result["error"].get("message", str(result["error"]))] if isinstance(result["error"], dict) else [str(result["error"]) ]
+        payload = build_api_response(
+            success=False,
+            data={},
+            trace_id=result.get("trace_id", trace_id),
+            errors=errors,
+            warnings=[]
+        )
+        return JSONResponse(status_code=200, content=jsonable_encoder(payload))
+
+    if isinstance(result, dict) and "reply" in result:
+        payload = build_api_response(
+            success=True,
+            data={"reply": result["reply"]},
+            trace_id=result.get("trace_id", trace_id)
+        )
+        return JSONResponse(status_code=200, content=jsonable_encoder(payload))
+
+    payload = build_api_response(
+        success=False,
+        data={},
+        trace_id=trace_id,
+        errors=["Unexpected result shape from query helper."],
+        warnings=[]
+    )
+    return JSONResponse(status_code=200, content=jsonable_encoder(payload))
 
 # ------------------ PREFERENCES ------------------ #
 

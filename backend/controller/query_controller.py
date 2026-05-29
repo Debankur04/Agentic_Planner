@@ -11,15 +11,15 @@ from llmops.trace_service import ExecutionTrace
 import uuid
 import asyncio
 from langchain_core.callbacks import BaseCallbackHandler
-from agent_file.agent.agentic_workflow import AgentRunner, TravelEngine
+from agent_file.agent.agentic_workflow import AgentRunner, MultiAgentEngine, TravelEngine
 from llmops.model_router import ModelRouter
 from agent_file.utils.config_loader import load_config
-from agent_file.agent.agentic_workflow import AgentRunner
 
 
 router = ModelRouter(load_config())
 runner = AgentRunner(router)
-travel_engine = TravelEngine(runner)
+multi_agent_engine = MultiAgentEngine(runner)
+travel_engine = TravelEngine(multi_agent_engine)
 
 def fallback_to_json(raw_output: str):
     import re, json
@@ -90,14 +90,26 @@ async def query_helper_stream(query):
             # ── 1. Budget guard ───────────────────────────────────────────────────
             if not token_tracker.check_budget(user_id=query.user_id):
                 trace.record("budget_exceeded", {"user_id": query.user_id})
-                loop.call_soon_threadsafe(q.put_nowait, {"error": "Daily Limit Exceeded. Try again tomorrow."})
+                loop.call_soon_threadsafe(q.put_nowait, {
+                    "error": {
+                        "message": "Daily Limit Exceeded. Try again tomorrow.",
+                        "code": "budget_exceeded"
+                    },
+                    "trace_id": request_id
+                })
                 return
 
             # ── 2. Guardrail / input sanitisation ─────────────────────────────────
             user_query, violation = sanitize_input(query.question)
             if violation:
                 trace.record("guardrail_violation", {"question_preview": query.question[:200]})
-                loop.call_soon_threadsafe(q.put_nowait, {"error": "Message violation detected"})
+                loop.call_soon_threadsafe(q.put_nowait, {
+                    "error": {
+                        "message": "Message violation detected",
+                        "code": "guardrail_violation"
+                    },
+                    "trace_id": request_id
+                })
                 return
 
             trace.record("guardrail_pass", {"sanitised_preview": user_query[:200]})
@@ -210,11 +222,17 @@ async def query_helper_stream(query):
             }, latency_ms=(time.time()-t0)*1000)
             
             # Send final structured chunk (optional but good for clients to know it's done)
-            loop.call_soon_threadsafe(q.put_nowait, {"final_reply": reply_text})
+            loop.call_soon_threadsafe(q.put_nowait, {"final_reply": reply_text, "trace_id": request_id})
 
         except Exception as e:
             trace.record("query_error", {"error": str(e)}, latency_ms=(time.time()-t0)*1000)
-            loop.call_soon_threadsafe(q.put_nowait, Exception(e))
+            loop.call_soon_threadsafe(q.put_nowait, {
+                "error": {
+                    "message": "Workflow failed during execution",
+                    "details": str(e)
+                },
+                "trace_id": request_id
+            })
         finally:
             try:
                 trace.save_to_redis(redis_client)
@@ -254,13 +272,25 @@ async def query_helper(query):
         # ── 1. Budget guard ───────────────────────────────────────────────────
         if not token_tracker.check_budget(user_id=query.user_id):
             trace.record("budget_exceeded", {"user_id": query.user_id})
-            return {'message': 'Daily Limit Exceeded. Try again tomorrow.'}
+            return {
+                "error": {
+                    "message": "Daily Limit Exceeded. Try again tomorrow.",
+                    "code": "budget_exceeded"
+                },
+                "trace_id": request_id
+            }
 
         # ── 2. Guardrail / input sanitisation ─────────────────────────────────
         user_query, violation = sanitize_input(query.question)
         if violation:
             trace.record("guardrail_violation", {"question_preview": query.question[:200]})
-            return {'message': 'Message violation detected'}
+            return {
+                "error": {
+                    "message": "Message violation detected",
+                    "code": "guardrail_violation"
+                },
+                "trace_id": request_id
+            }
 
         trace.record("guardrail_pass", {"sanitised_preview": user_query[:200]})
 
@@ -375,13 +405,19 @@ async def query_helper(query):
         }, latency_ms=(time.time()-t0)*1000)
 
         # Return just the reply string — the frontend reads data.reply
-        return {"reply": reply_text}
+        return {"reply": reply_text, "trace_id": request_id}
 
     except Exception as e:
         trace.record("query_error", {
             "error": str(e)
         }, latency_ms=(time.time()-t0)*1000)
-        raise e
+        return {
+            "error": {
+                "message": "Workflow failed during execution",
+                "details": str(e)
+            },
+            "trace_id": request_id
+        }
 
     finally:
         # Always persist trace regardless of success / failure
