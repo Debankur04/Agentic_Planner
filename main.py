@@ -25,10 +25,17 @@ load_dotenv()
 
 app = FastAPI()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s [%(request_id)s] %(message)s",
-)
+
+class RequestIDLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "request_id"):
+            record.request_id = ""
+        return True
+
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s [%(request_id)s] %(message)s"))
+handler.addFilter(RequestIDLogFilter())
+logging.basicConfig(level=logging.INFO, handlers=[handler])
 logger = logging.getLogger("agentic_planner")
 
 

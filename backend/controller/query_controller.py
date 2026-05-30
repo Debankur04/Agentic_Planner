@@ -11,15 +11,14 @@ from llmops.trace_service import ExecutionTrace
 import uuid
 import asyncio
 from langchain_core.callbacks import BaseCallbackHandler
-from agent_file.agent.agentic_workflow import AgentRunner, MultiAgentEngine, TravelEngine
+from agent_file.agent.agentic_workflow import AgentRunner, TravelEngine
 from llmops.model_router import ModelRouter
 from agent_file.utils.config_loader import load_config
 
 
 router = ModelRouter(load_config())
 runner = AgentRunner(router)
-multi_agent_engine = MultiAgentEngine(runner)
-travel_engine = TravelEngine(multi_agent_engine)
+travel_engine = TravelEngine(runner)
 
 def fallback_to_json(raw_output: str):
     import re, json
