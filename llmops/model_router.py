@@ -79,6 +79,22 @@ class ModelRouter:
             self._clients[model_key] = self._build_client(model_key)
         return self._clients[model_key]
 
+    def get_llm(self, agent_name: str, query: str = "", user_tier: str = "standard"):
+        """Return a client for the selected model.
+
+        If a query is provided, use the router's selection logic; otherwise fall
+        back to the configured default model.
+        """
+        if query:
+            try:
+                model_key = self.select_model(query, user_tier=user_tier)
+            except Exception as exc:
+                print(f"[ModelRouter] select_model failed: {exc}")
+                model_key = self.config["routing_rules"].get("default_model", "primary")
+        else:
+            model_key = self.config["routing_rules"].get("default_model", "primary")
+        return self.get_client(model_key)
+
     def _classify_intent(self, query: str) -> bool:
         """Returns True if the query is a simple factual/greeting question, False if complex/reasoning."""
         try:

@@ -1,5 +1,6 @@
 import json
 import time
+import traceback
 from backend.supabase_client.db_operations import (
       add_message, see_message, get_conversation_memory, update_conversation_memory,
       get_preference
@@ -64,9 +65,22 @@ class QueueCallbackHandler(BaseCallbackHandler):
         self.q = q
         self.loop = loop
 
+    def emit_event(self, event: dict) -> None:
+        if event:
+            self.loop.call_soon_threadsafe(self.q.put_nowait, event)
+
+    def on_agent_event(self, event: dict) -> None:
+        self.emit_event(event)
+
     def on_llm_new_token(self, token: str, **kwargs) -> None:
         if token:
             self.loop.call_soon_threadsafe(self.q.put_nowait, token)
+
+
+def chunk_text(text: str, chunk_size: int = 48):
+    text = str(text or "")
+    for start in range(0, len(text), chunk_size):
+        yield text[start:start + chunk_size]
 
 async def query_helper_stream(query):
     # ── Trace bootstrap ──────────────────────────────────────────────────────
@@ -164,11 +178,10 @@ async def query_helper_stream(query):
             t_agent = time.time()
             trace.record("agent_call_start", {"request_id": request_id})
 
-            reply, new_pref, new_history, is_hitl = await asyncio.wait_for(
+            agent_result = await asyncio.wait_for(
                 asyncio.to_thread(
                     travel_engine.process_query,
                     user_input=user_query,
-                    preference=preference,
                     history=history_str,
                     memory=memory,
                     user_id=query.user_id,
@@ -177,6 +190,17 @@ async def query_helper_stream(query):
                 ),
                 timeout=45
             )
+
+            if isinstance(agent_result, tuple) and len(agent_result) == 4:
+                reply, new_history, is_hitl = agent_result
+            elif isinstance(agent_result, tuple) and len(agent_result) == 3:
+                reply, new_history = agent_result
+                is_hitl = False
+            else:
+                raise ValueError("Agent returned an unexpected response shape")
+
+            if not isinstance(is_hitl, bool):
+                is_hitl = False
 
             trace.record("agent_call_end", {
                 "reply_preview": str(reply)[:200]
@@ -219,16 +243,23 @@ async def query_helper_stream(query):
                 "request_id": request_id,
                 "answer_preview": str(final_output)
             }, latency_ms=(time.time()-t0)*1000)
+
+            for chunk in chunk_text(reply_text):
+                await q.put(chunk)
+                await asyncio.sleep(0.005)
             
             # Send final structured chunk (optional but good for clients to know it's done)
-            loop.call_soon_threadsafe(q.put_nowait, {"final_reply": reply_text, "trace_id": request_id})
+            await q.put({"final_reply": reply_text, "trace_id": request_id})
 
         except Exception as e:
-            trace.record("query_error", {"error": str(e)}, latency_ms=(time.time()-t0)*1000)
+            tb = traceback.format_exc()
+            print(f"[query_controller] stream workflow failed: {e}\n{tb}")
+            trace.record("query_error", {"error": str(e), "traceback": tb}, latency_ms=(time.time()-t0)*1000)
             loop.call_soon_threadsafe(q.put_nowait, {
                 "error": {
                     "message": "Workflow failed during execution",
-                    "details": str(e)
+                    "details": str(e),
+                    "traceback": tb
                 },
                 "trace_id": request_id
             })
@@ -344,11 +375,10 @@ async def query_helper(query):
         t_agent = time.time()
         trace.record("agent_call_start", {"request_id": request_id})
 
-        reply, new_pref, new_history, is_hitl = await asyncio.wait_for(
+        reply, new_history, is_hitl = await asyncio.wait_for(
             asyncio.to_thread(
                 travel_engine.process_query,
                 user_input=user_query,
-                preference=preference,
                 history=history_str,
                 memory=memory,
                 user_id=query.user_id
@@ -363,6 +393,7 @@ async def query_helper(query):
         # ── 8. Process / validate output ──────────────────────────────────────
         t_proc = time.time()
         if not is_hitl:
+            print(reply)
             reply = process_llm_output(reply)
             final_output = clean_llm_output(reply)
         else:
@@ -407,13 +438,17 @@ async def query_helper(query):
         return {"reply": reply_text, "trace_id": request_id}
 
     except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[query_controller] query workflow failed: {e}\n{tb}")
         trace.record("query_error", {
-            "error": str(e)
+            "error": str(e),
+            "traceback": tb
         }, latency_ms=(time.time()-t0)*1000)
         return {
             "error": {
                 "message": "Workflow failed during execution",
-                "details": str(e)
+                "details": str(e),
+                "traceback": tb
             },
             "trace_id": request_id
         }

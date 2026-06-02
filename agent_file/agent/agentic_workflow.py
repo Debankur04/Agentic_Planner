@@ -1,18 +1,17 @@
 from langchain_core.messages import SystemMessage, ToolMessage, HumanMessage
 import json
-from langgraph.graph import StateGraph, MessagesState, END, START
+from langgraph.graph import StateGraph, MessagesState, END, START, add_messages
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.tools import tool
 from langchain_core.messages import AIMessage
 from llmops.token_tracker import *
 from agent_file.utils.model_loader import *
-from agent_file.prompt_library.prompt import SYSTEM_PROMPT
 from agent_file.prompt_library.prompt_maker import *
 from fastapi import HTTPException
-from typing import Dict, Any
+from typing import Dict, Any, Annotated, TypedDict
 import time
 import logging
-from agent_file.agent.exceptions import NodeExecutionError, WorkflowExecutionError
+from agent_file.prompt_library.multi_agent_prompts import build_intake_prompt, build_research_prompt, build_writer_prompt
 
 # ✅ Tools
 from agent_file.tools.flight_search import get_flight_search_tool
@@ -29,18 +28,39 @@ from agent_file.prompt_library.prompt_maker import fallback_json
 logger = logging.getLogger(__name__)
 token_tracker = TokenTracker(redis_client=redis_client)
 
-def ensure_valid_node_output(result: Any, node_name: str) -> dict:
-    if not isinstance(result, dict):
-        raise NodeExecutionError(node_name, result)
-    return result
+
+# @tool
+# def ask_human(question: str) -> str:
+#     """Ask the user a question to clarify one of these missing critical fields only: source city, budget, start date, or tenure."""
+#     return question
+
+def merge_dicts(left: dict, right: dict) -> dict:
+    return {**left, **right}
+
+import contextvars
 
 def run_with_timeout(app, input_data, config):
+    ctx = contextvars.copy_context()
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        future = executor.submit(app.invoke, input_data, config)
+        future = executor.submit(ctx.run, app.invoke, input_data, config)
         try:
             return future.result(timeout=30)
         except concurrent.futures.TimeoutError:
             raise HTTPException(408, detail="Request timeout (30s)")
+
+
+class AgentState(TypedDict):
+    messages: Annotated[list, add_messages]
+    workflow_state: Annotated[dict, merge_dicts]
+    user_id: str
+    preference: str
+    history: str
+    memory: str
+
+    # Optional values may be added by workflow nodes
+    # such as thread ids, tool results, and state metadata.
+
+    # NOTE: langgraph requires a typed state schema for compile-time validation.
 
 
 class GraphBuilder:
@@ -53,12 +73,8 @@ class GraphBuilder:
         get_current_weather, get_weather_forecast = get_weather_tools()
         find_routes, estimate_delay, live_train_update, get_schedule, get_code_station = get_railway_search_tool()
 
-        @tool
-        def ask_human(question: str) -> str:
-            """Ask the user a question to clarify one of these missing critical fields only: source city, budget, start date, or tenure."""
-            return question
-
-        self.intake_tools = [ask_human]
+        # self.intake_tools = [ask_human]
+        self.intake_tools = []
         self.research_tools = [
             find_flights,
             search_hotel,
@@ -72,489 +88,449 @@ class GraphBuilder:
             estimate_delay,
             live_train_update,
             get_schedule,
-            get_code_station
+            get_code_station,
         ]
-        self.tools = self.research_tools + self.intake_tools
-        self.tool_map = {tool.name: tool for tool in self.tools}
-        self.system_prompt = SYSTEM_PROMPT
+        self.tool_map = {tool.name: tool for tool in self.research_tools + self.intake_tools}
 
     def _get_default_workflow_state(self, user_input: str = "") -> Dict[str, Any]:
         return {
-            "workflow_id": None,
             "user_input": user_input,
-            "current_agent": None,
             "tool_results": {},
-            "trace_events": [],
-            "last_response_preview": None,
-            "status": "pending"
+            "clarification_history": {},
+            "ask_human_blocked": False,
+            "phase": "",
         }
 
-    # ------------------ SHARED LLM HELPERS ------------------
-    def _get_last_user_message(self, state: MessagesState) -> str:
-        messages = state.get("messages", [])
-        if not messages:
-            return ""
-        return getattr(messages[-1], "content", "")
+    def _append_state_response(self, state, response, agent_name):
+        # Append the agent response to the existing messages list
+        existing = state.get("messages", []) or []
+        return {
+            **state,
+            "messages": existing + [response],
+        }
+
+    def _invoke_llm(self, prompt_messages: list, state: MessagesState, config: dict, agent_name: str, tools: list):
+        print("STATE TYPES")
+        for k, v in state.items():
+            print(k, type(v))
+
+        print("CONFIG TYPES")
+        for k, v in config.items():
+            print(k, type(v))
+        try:
+            llm = self.router.get_llm(agent_name)
+        except Exception as e:
+            print(f"[GraphBuilder] ERROR selecting llm for agent={agent_name}: {e}")
+            raise
+
+        tool_names = [getattr(tool, "name", str(tool)) for tool in tools]
+        print(f"[GraphBuilder] invoking llm {agent_name} using {llm} with tools={tool_names}")
+        llm = llm.bind_tools(tools)
+
+        return llm.invoke(prompt_messages)
 
     def _get_original_user_request(self, state: MessagesState) -> str:
-        if "workflow_state" in state and state["workflow_state"].get("user_input"):
-            return state["workflow_state"]["user_input"]
-        for msg in state.get("messages", []):
-            if isinstance(msg, HumanMessage):
-                return getattr(msg, "content", "")
-        return self._get_last_user_message(state)
+        for message in reversed(state["messages"]):
+            if isinstance(message, HumanMessage):
+                return message.content
+        return ""
 
-    def _invoke_llm(self, messages, state: MessagesState, config: dict, agent_name: str, tools):
+    def _log_node_entry(self, node_name: str, state: MessagesState):
+        try:
+            msgs = state.get("messages", []) or []
+            last_type = type(msgs[-1]).__name__ if msgs else "None"
+            print("=" * 80)
+            print("NODE:", node_name)
+            print("MESSAGE COUNT:", len(msgs))
+            print("LAST MESSAGE TYPE:", last_type)
+            print("PHASE:", state.get("workflow_state", {}).get("phase"))
+            print("=" * 80)
+        except Exception as e:
+            logger.debug("_log_node_entry failed: %s", e)
+
+    def intake_node(self, state: AgentState, config: dict = None):
         config = config or {}
-        trace = config.get("configurable", {}).get("trace")
-        user_id = state.get("user_id", "")
-        if trace:
-            trace.record(f"{agent_name}_start", {"message_count": len(messages), "user_id": user_id})
-
-        if not token_tracker.check_budget(user_id, user_tier='free'):
-            raise HTTPException(429, detail={
-                "error": "daily_budget_exceeded",
-                "message": "You've reached your daily AI usage limit. Upgrade to continue.",
-                "reset_at": "midnight UTC"
-            })
-
-        attempted = set()
-        while True:
-            try:
-                model_key = self.router.select_model(self._get_last_user_message(state), exclude_models=attempted)
-            except RuntimeError:
-                raise HTTPException(500, "All models exhausted")
-
-            if model_key in attempted:
-                raise HTTPException(500, "All models exhausted")
-
-            if attempted and trace:
-                trace.record("llm_retry", {
-                    "retry_model": model_key,
-                    "already_tried": list(attempted)
-                })
-
-            attempted.add(model_key)
-            if trace:
-                trace.record("model_selected", {
-                    "model_key": model_key,
-                    "model_name": self.router.config["models"][model_key]["model_name"],
-                    "provider": self.router.config["models"][model_key]["provider"]
-                })
-
-            client = self.router.get_client(model_key)
-            if trace:
-                trace.record("client_initialized", {"model_key": model_key})
-
-            llm = client.bind_tools(tools)
-            if trace:
-                trace.record("tools_bound", {
-                    "model_key": model_key,
-                    "tools": [t.name for t in tools]
-                })
-
-            if trace:
-                trace.record("llm_invoke_start", {
-                    "model_key": model_key,
-                    "message_count": len(messages)
-                })
-            start = time.time()
-            try:
-                response = llm.invoke(messages)
-                latency = (time.time() - start) * 1000
-                self.router.record_success(model_key, latency)
-                if trace:
-                    trace.record("llm_invoke_success", {
-                        "model": model_key,
-                        "response_preview": str(getattr(response, "content", ""))[:200],
-                        "has_tool_calls": bool(getattr(response, "tool_calls", None))
-                    }, latency_ms=latency)
-                break
-            except Exception as e:
-                self.router.record_failure(model_key, e)
-                if trace:
-                    trace.record("llm_invoke_error", {"model": model_key, "error": str(e)})
-
-        model_name = self.router.config["models"][model_key]["model_name"]
-        usage_data = getattr(response, "usage", None)
-        if usage_data:
-            usage = TokenUsage(
-                input_tokens=usage_data.prompt_tokens,
-                output_tokens=usage_data.completion_tokens,
-                model=model_name
-            )
-            token_tracker.record_usage(user_id, usage)
-
-        return response
-
-    def _append_state_response(self, state: MessagesState, response, agent_name: str):
-        state["workflow_state"]["current_agent"] = agent_name
-        state["workflow_state"]["last_response_preview"] = str(getattr(response, "content", ""))[:1000]
-        return {"messages": state["messages"] + [response]}
-
-    def _parse_decision_from_text(self, text: str) -> str:
-        normalized = text.lower()
-        if any(keyword in normalized for keyword in ["impossible", "cannot", "no feasible", "not possible", "unavailable"]):
-            return "impossible"
-        if any(keyword in normalized for keyword in ["more information", "need more", "clarify", "clarification", "more details"]):
-            return "more_research"
-        return "pass"
-
-    # ------------------ INTAKE AGENT NODE ------------------
-    def intake_node(self, state: MessagesState, config: dict = None):
-        config = config or {}
-        trace = config.get("configurable", {}).get("trace")
-        messages = state.get("messages", [])
+        self._log_node_entry("tool", state)
         original_request = self._get_original_user_request(state)
-        user_input = original_request
-
-        if "workflow_state" not in state:
-            state["workflow_state"] = self._get_default_workflow_state(user_input=original_request)
+        state.setdefault("workflow_state", self._get_default_workflow_state(user_input=original_request))
         state["workflow_state"]["user_input"] = original_request
         state["workflow_state"]["phase"] = "intake"
-        state["workflow_state"]["current_agent"] = "intake"
+        self._log_node_entry("intake", state)
 
-        asked_questions = state["workflow_state"].get("clarification_questions", [])
-        previous_clarification_history = self._format_clarification_history(state)
-        last_question = state["workflow_state"].get("last_clarification_question", "none")
-        clarification_answer_text = self._get_clarification_answer(state)
-
-        system_prompt = (
-            "You are the intake agent for a travel planning workflow. "
-            "Your job is to decide whether the user request is complete enough to start research, "
-            "or whether you need to ask the user for more information. "
-            "Use ask_human only for these missing critical values: source city, budget, start date, or tenure. "
-            "Do not ask for end date, destination, accommodation, route details, or any other field. "
-            "If the user has already answered a clarification, do not ask the same or a similar question again. "
-            "Treat the previous clarification answer as final unless a different allowed field is missing. "
-            "If the core fields source city, destination, budget, start date, and tenure are already present, do not ask anything. "
-            "If other travel details are missing, assume moderate defaults in a reasonable way without asking. "
-            "Do not ask more than one clarification question in this intake pass. "
-            "If the destination is missing, infer a sensible option rather than asking about it."
-        )
-        user_prompt = (
-            f"User request: {original_request}\n"
-            f"Previous clarification history:\n{previous_clarification_history}\n"
-            f"Last clarification question: {last_question}\n"
-            f"Clarification answer: {clarification_answer_text}\n"
-            "Provide a structured intake plan with assumed defaults for missing details. "
-            "Only call ask_human for source city, budget, start date, or tenure. "
-            "IMPORTANT: The field 'clarification_answer' contains the user's answer to a previous question. "
-            "If clarification_answer is non-empty, treat it as final and DO NOT call ask_human again. "
-            "Proceed directly to producing the intake plan."
+        # research_result is stored as a raw string/object (not a dict with raw_output)
+        research_output = state["workflow_state"].get("research_result", "")
+        preference = state.get("preference", "")
+        history = state.get("history", "")
+        memory = state.get("memory", "")
+        
+        system_prompt, user_prompt = build_intake_prompt(
+            original_request,
+            preference,
+            history,
+            memory,
+            research_agent_input=research_output,
         )
         prompt_messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
 
         response = self._invoke_llm(prompt_messages, state, config, agent_name="intake", tools=self.intake_tools)
-        state["workflow_state"]["intake_result"] = {"raw_output": str(getattr(response, "content", ""))}
+        # Store raw content returned by the LLM directly (no JSON wrapping)
+        state["workflow_state"]["intake_result"] = getattr(response, "content", "")
         if hasattr(response, "tool_calls") and response.tool_calls:
-            state["workflow_state"]["intake_result"]["tool_calls"] = [tc["name"] for tc in response.tool_calls]
+            state["workflow_state"]["intake_tool_calls"] = [tc["name"] for tc in response.tool_calls]
 
         return self._append_state_response(state, response, agent_name="intake")
 
-    # ------------------ RESEARCH AGENT NODE ------------------
-    def research_node(self, state: MessagesState, config: dict = None):
+    def research_node(self, state: AgentState, config: dict = None):
+        print("RESEARCH STATE")
+        print(state)
+        print("KEYS:", state.keys())
         config = config or {}
-        trace = config.get("configurable", {}).get("trace")
-        state.setdefault("workflow_state", self._get_default_workflow_state(user_input=self._get_last_user_message(state)))
         state["workflow_state"]["phase"] = "research"
-        state["workflow_state"]["current_agent"] = "research"
+        self._log_node_entry("research", state)
 
         user_input = state["workflow_state"].get("user_input", self._get_original_user_request(state))
-        clarification_answer = state["workflow_state"].get("clarification_answer", self._get_clarification_answer(state))
-        intake_output = state["workflow_state"].get("intake_result", {}).get("raw_output", "")
-        if clarification_answer:
-            intake_output += f"\nClarification answer: {clarification_answer}"
-
-        system_prompt = (
-            "You are the research agent. Use all available travel tools to gather routes, pricing, weather, and availability. "
-            "Do not ask the user any additional questions. "
-            "Only investigate feasible travel connections and clearly explain any impossible or non-viable routes. "
-            "If no viable rail or land route exists, state that directly and focus on the practical alternative. "
-            "Assume reasonable defaults for any missing details outside the allowed clarification fields, including destination, accommodation, and trip length. "
-            "Do not use ask_human or request more user input."
+        clarification_history = state["workflow_state"].get("clarification_history", {})
+        clarification_answer = list(clarification_history.values())[-1] if clarification_history else ""
+        # Use the raw intake output as-is. LLMs are responsible for producing JSON when needed.
+        intake_output = state["workflow_state"].get(
+            "intake_result",
+            ""
         )
-        user_prompt = (
+        if clarification_answer and "Clarification answer:" not in str(intake_output):
+            if intake_output:
+                intake_output = f"{intake_output}\nClarification answer: {clarification_answer}"
+            else:
+                intake_output = f"Clarification answer: {clarification_answer}"
+
+        research_instructions = (
             f"User request: {user_input}\n"
-            f"Intake plan: {intake_output}\n"
+            f"Intake plan:\n{intake_output}\n"
             "Use tools when appropriate to collect journey data, route options, fees, and weather information. "
             "If you can resolve the journey with the information available, do so. "
             "If a requested route is impossible, explain why and identify realistic alternatives."
         )
+        system_prompt, user_prompt = build_research_prompt(
+            user_input=user_input,
+            intake_plan=intake_output,
+            research_instructions=research_instructions,
+            preference=state.get("preference", ""),
+            history=state.get("history", ""),
+            memory=state.get("memory", ""),
+            previous_tool_results=state.get("workflow_state", {}).get("tool_results", {}),
+            clarification_history=state.get("workflow_state", {}).get("clarification_history", {}),
+        )
         prompt_messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+        tool_results = state["workflow_state"].get("tool_results", {})
+        tools = []
 
-        response = self._invoke_llm(prompt_messages, state, config, agent_name="research", tools=self.research_tools)
-        state["workflow_state"]["research_result"] = {"raw_output": str(getattr(response, "content", ""))}
+        if not tool_results:
+            tools = self.research_tools
+        response = self._invoke_llm(
+            prompt_messages,
+            state,
+            config,
+            agent_name="research",
+            tools=tools
+        )
+        research_text = getattr(response, "content", "")
+        # Keep research result as raw content (string or object) without serializing
+        state["workflow_state"]["research_result"] = research_text
+        state["workflow_state"]["validation_summary"] = research_text
+        # Record any tool calls suggested by the research agent
         if hasattr(response, "tool_calls") and response.tool_calls:
-            state["workflow_state"]["research_result"]["tool_calls"] = [tc["name"] for tc in response.tool_calls]
+            state["workflow_state"]["research_tool_calls"] = [tc["name"] for tc in response.tool_calls]
 
         return self._append_state_response(state, response, agent_name="research")
 
-    # ------------------ RESEARCH VALIDATION NODE ------------------
-    def validation_node(self, state, config=None):
-        # Get research_result stored in workflow_state — don't rely on message scan
-        research_text = state.get("workflow_state", {}).get("research_result", {}).get("raw_output", "")
-        
-        if not research_text:
-            # fallback: scan messages
-            for msg in reversed(state["messages"]):
-                if not isinstance(msg, ToolMessage) and hasattr(msg, "content") and msg.content:
-                    research_text = str(msg.content)
-                    break
-        
-        decision = self._parse_decision_from_text(research_text)
-        state["workflow_state"]["validation_decision"] = decision
-        state["workflow_state"]["validation_summary"] = research_text  # ✅ no truncation
-        return {"messages": state["messages"]}
-
-    # ------------------ WRITER AGENT NODE ------------------
-    def writer_node(self, state: MessagesState, config: dict = None):
+    def writer_node(self, state: AgentState, config: dict = None):
+        print("WRITER INPUT")
+        print(state["workflow_state"]["tool_results"])
+        print(state["workflow_state"]["research_result"])
+        print(state["history"])
         config = config or {}
-        state.setdefault("workflow_state", self._get_default_workflow_state(user_input=self._get_last_user_message(state)))
         state["workflow_state"]["phase"] = "writer"
-        state["workflow_state"]["current_agent"] = "writer"
+        self._log_node_entry("writer", state)
 
         user_input = state["workflow_state"].get("user_input", "")
-        research_text = state["workflow_state"].get("research_result", {}).get("raw_output", "")
+        validated_summary = (
+    state["workflow_state"].get("validation_summary")
+    or state["workflow_state"].get("research_result", "")
+)
+        print("="*50)
+        print("USER INPUT")
+        print(user_input)
 
-        system_prompt = (
-            "You are a travel writer. Create a polished, user-friendly travel summary and recommendation based on the research output. "
-            "Do not invent facts. If the journey is impossible, explain why clearly. "
-            "If assumptions were required, state them clearly as assumptions. "
-            "If the user already provided source city, destination, budget, start date, and tenure, do not suggest that no details were given. "
-            "Only mention assumptions for details that were actually missing and necessary to complete the plan."
-        )
-        user_prompt = (
-            f"User request: {user_input}\n"
-            f"Research findings: {research_text}\n"
-            "Write the final response as a helpful travel plan or recommendation. "
-            "Mention any assumed defaults only when they were necessary and label them explicitly as assumptions."
+        print("="*50)
+        print("VALIDATED SUMMARY")
+        print(validated_summary)
+
+        print("="*50)
+        print("TOOL RESULTS")
+        print(state["workflow_state"].get("tool_results"))
+        system_prompt, user_prompt = build_writer_prompt(
+            user_input,
+            validated_summary,
+            tool_results=state["workflow_state"].get("tool_results", {}),
+            preference=...,
+            relevant_memory=...
         )
         prompt_messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
 
         response = self._invoke_llm(prompt_messages, state, config, agent_name="writer", tools=[])
-        state["workflow_state"]["final_output"] = str(getattr(response, "content", ""))
+        state["workflow_state"]["final_output"] = getattr(response, "content", "")
 
         return self._append_state_response(state, response, agent_name="writer")
 
-    # ------------------ TOOL NODE ------------------
     def tool_node(self, state: MessagesState, config: dict = None):
         config = config or {}
-        last_message = state["messages"][-1]
         trace = config.get("configurable", {}).get("trace")
         outputs = []
-        if "workflow_state" not in state:
-            state["workflow_state"] = self._get_default_workflow_state(user_input="")
-        current_agent = state["workflow_state"].get("current_agent", "research")
-        state["workflow_state"]["current_agent"] = "tool"
 
+        last_message = state["messages"][-1]
+        # ask_human tool is disabled in this test flow.
+        # ask_human_call = None
+        # if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        #     ask_human_call = next((tc for tc in last_message.tool_calls if tc["name"] == "ask_human"), None)
+
+        # if ask_human_call is not None:
+        #     return {
+        #         "messages": state["messages"],
+        #         "workflow_state": state["workflow_state"],
+        #     }
+
+        # if isinstance(last_message, HumanMessage) and len(state["messages"]) > 1:
+        #     previous_message = state["messages"][-2]
+        #     if hasattr(previous_message, "tool_calls") and previous_message.tool_calls:
+        #         ask_human_call = next((tc for tc in previous_message.tool_calls if tc["name"] == "ask_human"), None)
+        #         if ask_human_call is not None:
+        #             question_text = ask_human_call["args"].get("question") if isinstance(ask_human_call["args"], dict) else str(ask_human_call["args"])
+        #             answer_text = getattr(last_message, "content", "").strip()
+        #             if answer_text:
+        #                 clarification_history = state["workflow_state"].setdefault("clarification_history", {})
+        #                 clarification_history[question_text] = answer_text
+        #                 state["workflow_state"]["clarification_answer"] = answer_text
+        #                 state["workflow_state"]["last_clarification_question"] = question_text
+        #                 state["workflow_state"]["ask_human_blocked"] = False
+
+        last_message = state["messages"][-1]
         if hasattr(last_message, "tool_calls") and last_message.tool_calls:
             for tool_call in last_message.tool_calls:
+                if tool_call["name"] == "ask_human":
+                    continue
                 tool_name = tool_call["name"]
-                args = tool_call["args"]
-                print(f"\n🔥 EXECUTING TOOL: {tool_name}")
-                print(f"📦 ARGS: {args}")
+                args = tool_call.get("args")
+                # If we already have results for this tool, reuse them instead of re-calling
+                existing = state.get("workflow_state", {}).get("tool_results", {}).get(tool_name)
+                if existing is not None:
+                    logger.debug("Using cached tool result for %s", tool_name)
+                    outputs.append(ToolMessage(content=str(existing), tool_call_id=tool_call.get("id")))
+                    continue
+
+                logger.debug("Executing tool %s with args=%s", tool_name, args)
                 if trace:
                     trace.record("tool_called", {"tool": tool_name, "args": str(args)[:300]})
-                cache_key = make_cache_key(tool_name, args)
-                cached = get_cache(cache_key)
-                if cached:
-                    print(f"⚡ CACHE HIT: {tool_name}")
-                    result = cached
-                    if trace:
-                        trace.record("tool_cache_hit", {"tool": tool_name})
-                else:
-                    print(f"🔥 CACHE MISS: {tool_name}")
-                    if tool_name in self.tool_map:
-                        try:
-                            t0 = time.time()
-                            result = self.tool_map[tool_name].invoke(args)
-                            t1 = (time.time() - t0) * 1000
-                            if trace:
-                                trace.record("tool_success", {"tool": tool_name, "result_preview": str(result)[:200]}, latency_ms=t1)
-                            if tool_name == "ask_human":
-                                question_text = args.get("question") if isinstance(args, dict) else str(args)
-                                normalized = question_text.lower()
-                                allowed_terms = [
-                                    "source city",
-                                    "origin city",
-                                    "departure city",
-                                    "departure location",
-                                    "budget",
-                                    "start date",
-                                    "departure date",
-                                    "tenure",
-                                    "trip length",
-                                    "length of stay"
-                                ]
-                                if not any(term in normalized for term in allowed_terms):
-                                    result = (
-                                        "Clarification blocked: only ask about source city, budget, start date, or tenure. "
-                                        "Assume other missing details moderately and continue."
-                                    )
-                                    state["workflow_state"]["ask_human_blocked"] = True
-                                else:
-                                    state["workflow_state"]["ask_human_blocked"] = False
-                                    self._record_clarification_question(state, question_text)
-                                    state["workflow_state"]["clarification_answer"] = ""
-                                if isinstance(result, dict) and "error" in result:
-                                    result = "Tool failed. Continue with available data."
-                                else:
-                                    set_cache(cache_key, result, ttl=300)
-                            else:
-                                if isinstance(result, dict) and "error" in result:
-                                    result = "Tool failed. Continue with available data."
-                                else:
-                                    set_cache(cache_key, result, ttl=300)
-                        except Exception as e:
-                            result = f"Tool error: {str(e)}"
-                            if trace:
-                                trace.record("tool_error", {"tool": tool_name, "error": str(e)})
-                            state["workflow_state"]["tool_results"][tool_name] = {"error": str(e)}
-                    else:
-                        result = "Tool not found"
-                print(f"✅ RESULT: {result}")
+                result = self._execute_tool(state, tool_call, trace)
+                logger.debug("Tool %s result: %s", tool_name, result)
                 outputs.append(ToolMessage(content=str(result), tool_call_id=tool_call["id"]))
 
-        state["workflow_state"]["current_agent"] = current_agent
-        return {"messages": state["messages"] + outputs}
+        # Return the full state with messages extended by tool outputs and
+        # preserve workflow_state so reducers/mergers keep other keys.
+        return {**state, "messages": state.get("messages", []) + outputs, "workflow_state": state.get("workflow_state", {})}
 
-    # ------------------ ASK HUMAN NODE ------------------
-    def ask_human_node(self, state: MessagesState):
-        state.setdefault("workflow_state", self._get_default_workflow_state(user_input=self._get_last_user_message(state)))
-        state["workflow_state"]["current_agent"] = "ask_human"
+    def _execute_tool(self, state: MessagesState, tool_call: dict, trace):
+        tool_name = tool_call["name"]
+        args = tool_call.get("args", {})
+        cache_key = make_cache_key(tool_name, args)
+        cached = get_cache(cache_key)
+        if cached:
+            if trace:
+                trace.record("tool_cache_hit", {"tool": tool_name})
+            return cached
 
-        clarification_question = None
-        clarification_question_index = None
-        for index, msg in enumerate(state["messages"]):
-            if not isinstance(msg, ToolMessage) and hasattr(msg, "tool_calls") and msg.tool_calls:
-                for tc in msg.tool_calls:
-                    if tc["name"] == "ask_human":
-                        clarification_question = tc["args"].get("question") if isinstance(tc["args"], dict) else str(tc["args"])
-                        clarification_question_index = index
-                        break
-                if clarification_question:
-                    break
+        if tool_name not in self.tool_map:
+            return "Tool not found"
 
-        if clarification_question:
-            self._record_clarification_question(state, clarification_question)
+        try:
+            t0 = time.time()
+            result = self.tool_map[tool_name].invoke(args)
+            t1 = (time.time() - t0) * 1000
+            if trace:
+                trace.record("tool_success", {"tool": tool_name, "result_preview": str(result)[:200]}, latency_ms=t1)
 
-            clarification_answer = None
-            for msg in state["messages"][clarification_question_index + 1:]:
-                if isinstance(msg, HumanMessage):
-                    content = getattr(msg, "content", "").strip()
-                    if content:
-                        clarification_answer = content
-                        break
+            if isinstance(result, dict) and "error" in result:
+                result = "Tool failed. Continue with available data."
 
-            if clarification_answer:
-                self._record_clarification_answer(state, clarification_question, clarification_answer)
+            # persist tool result into workflow state for future research prompts
+            state.setdefault("workflow_state", {}).setdefault("tool_results", {})
+            try:
+                state["workflow_state"]["tool_results"][tool_name] = result
+            except Exception:
+                state["workflow_state"]["tool_results"][tool_name] = str(result)
 
-        return {"messages": state["messages"]}
+            set_cache(cache_key, result, ttl=300)
+            return result
+        except Exception as e:
+            if trace:
+                trace.record("tool_error", {"tool": tool_name, "error": str(e)})
+            # Store tool error as plain string
+            state["workflow_state"]["tool_results"][tool_name] = str(e)
+            return f"Tool error: {str(e)}"
 
-    # ------------------ ROUTING ------------------
-    def route_after_intake(self, state: MessagesState):
-        last_message = state["messages"][-1]
-        if state.get("workflow_state", {}).get("ask_human_blocked"):
-            return "research"
-        if hasattr(last_message, "tool_calls") and any(tc["name"] == "ask_human" for tc in last_message.tool_calls):
-            return "ask_human_node"
+    def route_after_intake(self, state: AgentState):
+        # ask_human is disabled in this test flow.
         return "research"
 
-    def route_after_tool(self, state: MessagesState):
-        current_agent = state.get("workflow_state", {}).get("current_agent", "research")
-        if current_agent == "intake":
-            return "intake"
-        if current_agent == "research":
-            return "research"
-        if current_agent in {"writer", "writer_impossible"}:
-            return current_agent
-        return "research"
+    def should_continue(self, state: AgentState):
+        messages = state["messages"]
+        last_message = messages[-1]
 
-    def route_after_validation(self, state: MessagesState):
+        print("SHOULD_CONTINUE")
+        print("LAST MESSAGE:", type(last_message).__name__)
+
+        if not (isinstance(last_message, AIMessage) and getattr(last_message, "tool_calls", None)):
+            print("ROUTE = validator")
+            return "validator"
+
+        if len(messages) > 15:
+            print("ROUTE = end")
+            return "end"
+
+        all_tool_signatures = []
+        for m in messages:
+            if hasattr(m, "tool_calls") and m.tool_calls:
+                for tc in m.tool_calls:
+                    all_tool_signatures.append(self._tool_call_signature(tc))
+
+        if len(all_tool_signatures) != len(set(all_tool_signatures)):
+            print("ROUTE = writer")
+            logger.warning("Repeated tool call detected. Stopping loop.")
+            return "writer"
+
+        print("ROUTE = research_tool")
+        return "research_tool"
+
+    def route_after_validation(self, state: AgentState):
         decision = state.get("workflow_state", {}).get("validation_decision", "pass")
         if decision == "more_research":
             return "research"
         if decision == "impossible":
-            return "writer_impossible"
+            return "end"
         return "writer"
 
-    def should_continue(self, state: MessagesState):
-        messages = state["messages"]
-        last_message = messages[-1]
-        if not hasattr(last_message, "tool_calls") or not last_message.tool_calls:
-            return "validate"
-        if any(tc["name"] == "ask_human" for tc in last_message.tool_calls):
-            return "ask_human_node"
-        if len(messages) > 15:
-            return "end"
-        
-        # ✅ Compare tool NAMES called across AI messages, not tool result content
-        all_tool_calls = []
-        for m in messages:
-            if hasattr(m, "tool_calls") and m.tool_calls:
-                for tc in m.tool_calls:
-                    all_tool_calls.append(tc["name"])
-        if len(all_tool_calls) != len(set(all_tool_calls)):
-            print("⚠️ Repeated tool call detected. Stopping loop.")
-            return "end"
-        return "tool"
+    def _tool_call_signature(self, tool_call: dict) -> tuple:
+        args = tool_call.get("args")
+        try:
+            # Use simple string representation for args to avoid JSON serialization
+            args_hash = str(args)
+        except Exception:
+            args_hash = repr(args)
+        return (tool_call.get("name"), args_hash)
 
-    # ------------------ BUILD GRAPH ------------------
+    def validator_node(self, state: AgentState, config: dict = None):
+        state.setdefault(
+        "workflow_state",
+        self._get_default_workflow_state()
+        )
+        print("VALIDATOR IN")
+        print(state["workflow_state"]["tool_results"].keys())
+        config = config or {}
+        
+
+        state["workflow_state"]["phase"] = "validator"
+
+        self._log_node_entry("validator", state)
+        # Build a validation prompt using the intake validator template.
+        original_request = state["workflow_state"].get("user_input", self._get_original_user_request(state))
+        research_output = state["workflow_state"].get("research_result", "")
+        preference = state.get("preference", "")
+        history = state.get("history", "")
+        memory = state.get("memory", "")
+
+        system_prompt, user_prompt = build_intake_prompt(
+            original_request,
+            preference,
+            history,
+            memory,
+            research_agent_input=research_output,
+            stage="validation",
+        )
+        prompt_messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+
+
+
+        try:
+            response = self._invoke_llm(prompt_messages, state, config, agent_name="validator", tools=[])
+            raw = getattr(response, "content", "")
+            # Try to parse structured JSON from the validator LLM
+            try:
+                parsed = json.loads(raw)
+                decision = parsed.get("decision", "more_research")
+            except Exception:
+                # Fallback heuristic if JSON isn't returned
+                text = str(raw).lower()
+                if any(k in text for k in ["impossible", "cannot", "not possible", "no feasible"]):
+                    decision = "impossible"
+                elif any(k in text for k in ["more information", "need more", "clarify", "more details"]):
+                    decision = "more_research"
+                else:
+                    decision = "pass"
+                parsed = {"decision": decision, "reason": str(raw), "missing_information": []}
+
+            state.setdefault("workflow_state", {})["validation_result"] = parsed
+            state["workflow_state"]["validation_decision"] = parsed.get("decision", decision)
+            state["workflow_state"]["validation_summary"] = parsed.get("reason", str(raw))
+
+            print("VALIDATOR OUT")
+            print(state["workflow_state"]["tool_results"].keys())
+        except Exception as e:
+            state.setdefault("workflow_state", {})["validation_result"] = {"decision": "more_research", "reason": str(e), "missing_information": []}
+            state["workflow_state"]["validation_decision"] = "more_research"
+
+        return state
+
     def build(self):
-        graph = StateGraph(MessagesState)
+        graph = StateGraph(AgentState)
         graph.add_node("intake", self.intake_node)
         graph.add_node("research", self.research_node)
-        graph.add_node("validation", self.validation_node)
+        graph.add_node("intake_tool", self.tool_node)
+        graph.add_node("research_tool", self.tool_node)
+        graph.add_node("validator", self.validator_node)
         graph.add_node("writer", self.writer_node)
-        graph.add_node("writer_impossible", self.writer_impossible_node)
-        graph.add_node("tool", self.tool_node)
-        graph.add_node("ask_human_node", self.ask_human_node)
 
         graph.add_edge(START, "intake")
         graph.add_conditional_edges(
             "intake",
             self.route_after_intake,
             {
-                "ask_human_node": "ask_human_node",
+                "intake_tool": "intake_tool",
                 "research": "research",
-                "end": END
-            }
+            },
         )
-        graph.add_edge("ask_human_node", "intake")
+        graph.add_edge("intake_tool", "intake")
         graph.add_conditional_edges(
             "research",
             self.should_continue,
             {
-                "tool": "tool",
-                "ask_human_node": "ask_human_node",
-                "validate": "validation",
-                "end": END
-            }
+                "research_tool": "research_tool",
+                "validator": "validator",
+                'writer': "writer",
+                "end": END,
+            },
         )
+        graph.add_edge("research_tool", "research")
         graph.add_conditional_edges(
-            "tool",
-            self.route_after_tool,
-            {
-                "intake": "intake",
-                "research": "research",
-                "writer": "writer",
-                "writer_impossible": "writer_impossible",
-                "end": END
-            }
-        )
-        graph.add_conditional_edges(
-            "validation",
+            "validator",
             self.route_after_validation,
             {
                 "research": "research",
                 "writer": "writer",
-                "writer_impossible": "writer_impossible"
-            }
+                "end": END,
+            },
         )
+        graph.add_edge("writer", END)
 
         self.checkpointer = MemorySaver()
-        return graph.compile(checkpointer=self.checkpointer, interrupt_before=["ask_human_node"])
+        return graph.compile(checkpointer=self.checkpointer, interrupt_before=["research_tool"])
 
 class AgentRunner:
     def __init__(self, router):
@@ -575,39 +551,39 @@ class AgentRunner:
 
         try:
             state = self.app.get_state(config)
-            
-            if state and state.next and "ask_human_node" in state.next:
-                # We are paused waiting for user input
-                last_msg = state.values["messages"][-1]
-                tool_call = next(tc for tc in last_msg.tool_calls if tc["name"] == "ask_human")
-                
-                tool_msg = ToolMessage(
-                    tool_call_id=tool_call["id"],
-                    name="ask_human",
-                    content=user_input
-                )
-                self.app.update_state(config, {"messages": [tool_msg]}, as_node="ask_human_node")
-                
-                output = run_with_timeout(self.app, None, config=config)
-            else:
-                output = run_with_timeout(self.app, {
-                    "messages": [HumanMessage(content=user_input)],
-                    "preference": preference,
-                    "history": history,
-                    "memory": memory,
-                    "user_id": user_id
-                }, config=config)
+            output = None
+            initial_data = {
+                "messages": [HumanMessage(content=user_input)],
+                "preference": preference,
+                "history": history,
+                "memory": memory,
+                "user_id": user_id,
+                "workflow_state": {
+                    "user_input": user_input,
+                    "tool_results": {},
+                    "clarification_history": {},
+                    "ask_human_blocked": False,
+                    "phase": ""
+                }
+            }
 
-            # Check if it paused again
-            state = self.app.get_state(config)
-            if state and state.next and "ask_human_node" in state.next:
-                # It just hit an interrupt, we need to return the question to the user
-                last_msg = state.values["messages"][-1]
-                tool_call = next(tc for tc in last_msg.tool_calls if tc["name"] == "ask_human")
-                question = tool_call["args"].get("question", "Could you provide more details?")
-                    
-                # Append an AIMessage so the controller extracts the question correctly
-                output["messages"] = list(output["messages"]) + [AIMessage(content=question, additional_kwargs={"is_hitl": True})]
+            if state and state.next and any(node in state.next for node in ["intake_tool", "research_tool"]):
+                # ask_human HITL path disabled for this test.
+                pass
+
+            if output is None:
+                output = run_with_timeout(self.app, initial_data, config=config)
+                output.setdefault("hitl_question", None)
+
+            while True:
+                state = self.app.get_state(config)
+                if not state or not state.next:
+                    break
+                if any(node in state.next for node in ["intake_tool", "research_tool"]):
+                    # ask_human HITL path disabled for this test.
+                    output = run_with_timeout(self.app, None, config=config)
+                    continue
+                break
 
             # Capture the final response for tracing
             final_msg = None
@@ -638,7 +614,7 @@ class AgentRunner:
     def fallback_json_agent(self, raw_input):
         prompt = fallback_json(raw_output= raw_input)
         fallback = self.fallback_json_llm.invoke(prompt)
-        return fallback
+        return str(getattr(fallback, "content", "")).strip()
 
 class TravelEngine:
     def __init__(self, agent_runner: AgentRunner):
@@ -657,27 +633,29 @@ class TravelEngine:
             request_id=conversation_id,
             conversation_id=conversation_id
         )
-
-        if not isinstance(output, dict) or "messages" not in output:
-            raise WorkflowExecutionError("LLM agent run returned invalid output", details={"output": output})
+        hitl_question = output.get("hitl_question") if isinstance(output, dict) else None
+        if hitl_question:
+            return hitl_question, "", history, True
 
         response = None
         is_hitl = False
         for msg in reversed(output["messages"]):
-            if not isinstance(msg, ToolMessage):
-                response = msg.content
-                if hasattr(msg, "additional_kwargs") and msg.additional_kwargs.get("is_hitl"):
-                    is_hitl = True
-                if not response and hasattr(msg, "tool_calls") and msg.tool_calls:
-                    response = "I've explored multiple options but couldn't finalize a complete itinerary within the search limit. Could you please provide more specific preferences (like exact dates or transport modes) so I can narrow down the search?"
-                break
+            if isinstance(msg, ToolMessage):
+                continue
 
-        if is_hitl:
-            return response, preference, history, is_hitl
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                continue
+
+            response = msg.content
+
+            if hasattr(msg, "additional_kwargs") and msg.additional_kwargs.get("is_hitl"):
+                is_hitl = True
+
+            print('ping !!')
+            break
 
         content = self._parse_response(response)
         reply = self._extract_reply(content)
-        pref = self._extract_preference(content)
 
         convo = f"""user query: 
                 {user_input} 
@@ -689,22 +667,20 @@ class TravelEngine:
         else:
             history += convo
 
-        return reply, pref, history, is_hitl
+        return reply, history, is_hitl
 
     def _parse_response(self, response):
-        try:
-            return json.loads(response) if isinstance(response, str) else response
-        except:
-            return response
+        # Previously we attempted to auto-parse JSON here. Keep the response as-is
+        # since LLMs will emit JSON when required and downstream consumers
+        # can handle string or dict accordingly.
+        return response
 
     def _extract_reply(self, content):
         if isinstance(content, dict) and "reply" in content:
             return content["reply"]
+        if isinstance(content, dict) and "message" in content:
+            return content["message"]
         return str(content)
-
-        if isinstance(content, dict) and content.get("confidence", 0) >= 80:
-            return content.get("preference")
-        return None
 
     def _summarizier(self, history, user_message):
         history = self.agent_runner.summary_agent(history, user_message)

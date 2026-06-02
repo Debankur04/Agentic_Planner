@@ -1,7 +1,12 @@
 from fastapi import FastAPI, Query, HTTPException, Depends, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, StreamingResponse
+import json
+import asyncio
+import re
+from contextvars import ContextVar
+from agent_file.agent.agentic_workflow import GraphBuilder
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -26,7 +31,7 @@ load_dotenv()
 app = FastAPI()
 
 
-class RequestIDLogFilter(logging.Filter):
+class SafeRequestIdFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         if not hasattr(record, "request_id"):
             record.request_id = ""
@@ -34,7 +39,7 @@ class RequestIDLogFilter(logging.Filter):
 
 handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s [%(request_id)s] %(message)s"))
-handler.addFilter(RequestIDLogFilter())
+handler.addFilter(SafeRequestIdFilter())
 logging.basicConfig(level=logging.INFO, handlers=[handler])
 logger = logging.getLogger("agentic_planner")
 
@@ -233,6 +238,71 @@ async def query_travel_agent(request: Request, query: QueryRequest, user=Depends
         warnings=[]
     )
     return JSONResponse(status_code=200, content=jsonable_encoder(payload))
+
+
+current_sse_context = ContextVar("current_sse_context", default=None)
+original_log_node = GraphBuilder._log_node_entry
+
+def patched_log_node(self, node_name: str, state):
+    original_log_node(self, node_name, state)
+    ctx = current_sse_context.get()
+    if ctx:
+        q, loop = ctx
+        if node_name in ["intake", "research", "validator", "writer"]:
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, {"agent": node_name})
+            except Exception:
+                pass
+
+GraphBuilder._log_node_entry = patched_log_node
+
+async def sse_query_helper(query: QueryRequest):
+    q = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    token = current_sse_context.set((q, loop))
+    
+    async def run_query():
+        try:
+            res = await query_helper(query)
+            await q.put({"final": res})
+        except Exception as e:
+            await q.put({"error": str(e)})
+            
+    task = asyncio.create_task(run_query())
+    
+    try:
+        while True:
+            item = await q.get()
+            if "agent" in item:
+                yield f"data: {json.dumps({'type': 'phase', 'phase': item['agent']})}\n\n"
+            elif "final" in item:
+                res = item["final"]
+                if "error" in res:
+                    yield f"data: {json.dumps(res)}\n\n"
+                else:
+                    reply = res.get("reply", "")
+                    # Stream by chunking word by word, preserving whitespaces
+                    chunks = re.split(r'(\s+)', reply)
+                    for chunk in chunks:
+                        if chunk:
+                            yield f"data: {json.dumps({'type': 'answer_chunk', 'content': chunk})}\n\n"
+                            if not chunk.isspace():
+                                await asyncio.sleep(0.005)
+                yield f"data: {json.dumps({'type': 'complete'})}\n\n"
+                break
+            elif "error" in item:
+                yield f"data: {json.dumps({'error': item['error']})}\n\n"
+                yield f"data: {json.dumps({'type': 'complete'})}\n\n"
+                break
+    finally:
+        current_sse_context.reset(token)
+        if not task.done():
+            task.cancel()
+
+@app.post("/sse_query")
+@limiter.limit("30/minute")
+async def sse_query_travel_agent(request: Request, query: QueryRequest, user=Depends(verify_token)):
+    return StreamingResponse(sse_query_helper(query), media_type="text/event-stream")
 
 # ------------------ PREFERENCES ------------------ #
 

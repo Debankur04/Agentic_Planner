@@ -34,7 +34,7 @@ class HotelSearchTool:
 
                 cleaned_results.append({
                     "name": hotel.get("name"),
-                    "price_per_night": hotel.get("rate_per_night", {}).get("extracted_lowest"),
+                    "price_per_night": hotel.get("rate_per_night", {}).get("lowest"),
                     "rating": hotel.get("overall_rating"),
                     "type": hotel.get("type"),
                     "amenities": hotel.get("amenities", [])[:5]  # keep it small
