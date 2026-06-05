@@ -25,6 +25,8 @@ from service.cache_service import redis_client
 from service.verify_token import verify_token
 from backend.mongo import get_trace_from_db
 from backend.controller.query_controller import query_helper, router as query_router
+from backend.controller.query_controller import quota_service
+from service.billing_service import BillingService
 
 load_dotenv()
 
@@ -72,6 +74,7 @@ app.add_exception_handler(RateLimitExceeded, lambda request, exc: JSONResponse(
 
 # ------------------ INIT GRAPH ONCE ------------------ #
 token_tracker = TokenTracker(redis_client= redis_client)
+billing_service = BillingService()
 
 # ------------------ CORS ------------------ #
 # Rate limiting middleware
@@ -215,7 +218,7 @@ async def query_travel_agent(request: Request, query: QueryRequest, user=Depends
         errors = [result["error"].get("message", str(result["error"]))] if isinstance(result["error"], dict) else [str(result["error"]) ]
         payload = build_api_response(
             success=False,
-            data={},
+            data=result["error"].get("quota", {}) if isinstance(result["error"], dict) else {},
             trace_id=result.get("trace_id", trace_id),
             errors=errors,
             warnings=[]
@@ -303,6 +306,59 @@ async def sse_query_helper(query: QueryRequest):
 @limiter.limit("30/minute")
 async def sse_query_travel_agent(request: Request, query: QueryRequest, user=Depends(verify_token)):
     return StreamingResponse(sse_query_helper(query), media_type="text/event-stream")
+
+
+# ------------------ QUOTA / BILLING ------------------ #
+
+@app.get("/quota/status", response_model=QuotaStatusResponse)
+@limiter.limit("50/minute")
+async def quota_status_api(request: Request, user_id: str = Query(...), user=Depends(verify_token)):
+    return quota_service.get_status(user_id).to_dict()
+
+
+@app.post("/billing/razorpay/order")
+@limiter.limit("20/minute")
+async def create_razorpay_order_api(request: Request, query: BillingOrderRequest, user=Depends(verify_token)):
+    try:
+        return billing_service.create_warlord_order(query.user_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/billing/razorpay/verify")
+@limiter.limit("20/minute")
+async def verify_razorpay_payment_api(request: Request, query: BillingVerifyRequest, user=Depends(verify_token)):
+    try:
+        return billing_service.verify_warlord_payment(
+            user_id=query.user_id,
+            order_id=query.razorpay_order_id or "",
+            payment_id=query.razorpay_payment_id,
+            signature=query.razorpay_signature,
+            subscription_id=query.razorpay_subscription_id or "",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/billing/razorpay/webhook")
+@limiter.limit("100/minute")
+async def razorpay_webhook_api(request: Request):
+    raw_body = await request.body()
+    signature = request.headers.get("X-Razorpay-Signature", "")
+    if not billing_service.verify_webhook_signature(raw_body, signature):
+        raise HTTPException(status_code=400, detail="Invalid Razorpay webhook signature")
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid webhook JSON")
+    return billing_service.handle_webhook_event(payload)
+
+
+@app.post("/billing/emperor/request", response_model=SimpleResponse)
+@limiter.limit("10/minute")
+async def emperor_request_api(request: Request, query: EmperorRequest, user=Depends(verify_token)):
+    result = billing_service.create_emperor_request(query.user_id, query.message or "")
+    return {"message": result["message"]}
 
 # ------------------ PREFERENCES ------------------ #
 

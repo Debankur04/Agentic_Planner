@@ -43,9 +43,11 @@ def build_intake_prompt(
 
 User Preferences: {preference}
 
-Chat History: {history}
+Recent Messages:
+{history}
 
-Recent Chat Memory: {memory}
+Relevant Memory:
+{memory}
     
 Today's Date: {date.today().isoformat()}
 
@@ -86,10 +88,10 @@ Intake plan:
 Preference:
 {preference}
 
-History (recent):
+Recent Messages:
 {history}
 
-Memory (relevant):
+Relevant Memory:
 {memory}
 
 Previous tool results (do not re-run tools that already have results):

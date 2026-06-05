@@ -19,6 +19,7 @@ def test_full_flow_no_clarification(monkeypatch):
     responses = [
         FakeLLMResponse(content='{"plan":"details"}', tool_calls=[]),
         FakeLLMResponse(content="Research complete and feasible.", tool_calls=[]),
+        FakeLLMResponse(content='{"decision":"pass","reason":"Looks feasible","missing_information":[]}', tool_calls=[]),
         FakeLLMResponse(content="Final itinerary ready.", tool_calls=[]),
     ]
 
@@ -38,6 +39,7 @@ def test_full_flow_no_clarification(monkeypatch):
     assert output.get("hitl_question") is None
 
 
+@pytest.mark.skip(reason="ask_human HITL path is disabled in the current workflow")
 def test_ask_human_then_resume(monkeypatch):
     router = Mock()
     responses = [
@@ -83,4 +85,22 @@ def test_repeated_tool_detection_exits():
         "workflow_state": {"validation_decision": "pass"}
     }
 
-    assert builder.should_continue(state) == "end"
+    assert builder.should_continue(state) == "validator"
+
+
+def test_completion_checks_reject_non_writer_final(monkeypatch):
+    router = Mock()
+    agent_runner = AgentRunner(router)
+    trace = Mock()
+    output = {
+        "workflow_state": {
+            "planning_output": "plan",
+            "research_output": "research",
+            "validation_output": {"decision": "pass"},
+            "writer_output": "",
+            "final_user_response": "research",
+        }
+    }
+
+    with pytest.raises(RuntimeError):
+        agent_runner._validate_final_output(output, trace)

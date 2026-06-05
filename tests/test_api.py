@@ -1,8 +1,11 @@
 import pytest
 from fastapi.testclient import TestClient
 from main import app
-from unittest.mock import patch, AsyncMock
-import json
+from service.verify_token import verify_token
+from unittest.mock import patch
+
+
+app.dependency_overrides[verify_token] = lambda: {"id": "test_user"}
 
 client = TestClient(app)
 
@@ -11,10 +14,10 @@ def test_health_check():
     response = client.get("/health")
     assert response.status_code == 200
     data = response.json()
-    assert data["status"] in ["healthy", "degraded", "unhealthy"]
-    assert "routing" in data
+    assert data["backend"] == "active"
+    assert "models" in data
 
-@patch("service.supabase_service.create_conversation")
+@patch("main.create_conversation")
 def test_create_conversation(mock_create_convo):
     """Test conversation creation with mocked DB"""
     mock_create_convo.return_value = "mock_convo_id_123"
@@ -25,14 +28,15 @@ def test_create_conversation(mock_create_convo):
     })
     
     assert response.status_code == 200
-    assert response.json()["message"] == "Conversation created successfully"
+    assert response.json()["conversation_id"] == "mock_convo_id_123"
 
-@patch("backend.controller.query_controller.travel_engine.process_query")
-def test_query_streaming_format(mock_process_query):
-    """Test that the /query endpoint streams using SSE correctly"""
-    # Mock the process query to return immediately
-    # We must mock it correctly based on the return type in query_controller
-    mock_process_query.return_value = ("Final Itinerary Plan", "test_pref", "test_history")
+@patch("main.query_helper")
+def test_query_response_format(mock_query_helper):
+    """Test that /query returns the unified API response envelope."""
+    async def fake_query_helper(query):
+        return {"reply": "Final Itinerary Plan", "trace_id": "req_test"}
+
+    mock_query_helper.side_effect = fake_query_helper
     
     response = client.post("/query", json={
         "question": "Plan a trip to London",
@@ -40,15 +44,11 @@ def test_query_streaming_format(mock_process_query):
         "conversation_id": "convo_999"
     })
     
-    # Check if the response is a streaming response
     assert response.status_code == 200
-    assert response.headers["content-type"] == "text/event-stream; charset=utf-8"
-    
-    content = response.text
-    # Check if it adheres to SSE format
-    assert content.startswith("data: ")
-    assert "final_reply" in content
-    assert "Final Itinerary Plan" in content
+    data = response.json()
+    assert data["success"] is True
+    assert data["data"]["reply"] == "Final Itinerary Plan"
+    assert data["trace_id"] == "req_test"
 
 def test_auth_signup_validation():
     """Test that auth endpoints validate payloads correctly"""

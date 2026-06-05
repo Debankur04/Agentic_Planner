@@ -16,6 +16,34 @@ class SimpleMessage(BaseModel):
 
 class QueryResponse(BaseModel):
     reply: str  # The plain-text markdown reply from the AI agent
+
+
+class QuotaStatusResponse(BaseModel):
+    allowed: bool
+    tier: str
+    limit: int
+    used: int
+    remaining: int
+    reset_at: str
+    billing_status: str
+    message: Optional[str] = ""
+
+
+class BillingOrderRequest(BaseModel):
+    user_id: str
+
+
+class BillingVerifyRequest(BaseModel):
+    user_id: str
+    razorpay_order_id: Optional[str] = ""
+    razorpay_subscription_id: Optional[str] = ""
+    razorpay_payment_id: str
+    razorpay_signature: str
+
+
+class EmperorRequest(BaseModel):
+    user_id: str
+    message: Optional[str] = ""
     
 # ------------------ AUTH ------------------ #
 

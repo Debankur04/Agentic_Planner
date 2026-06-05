@@ -26,6 +26,11 @@ For everything else — destination, accommodation, transport mode — apply a s
 and note it as an assumption. Do not ask the user.
 If any other detail is missing, infer the most practical value, label it as an assumption,
 and continue with the plan. Never respond by asking the user for more details.
+
+For domestic trips inside India:
+1. Prefer trains when travel time is reasonable.
+2. Use flights only when distance or duration makes rail impractical.
+3. Always research train options before considering flights.
  
 Return ONLY valid JSON in this exact structure:
 {
@@ -95,7 +100,14 @@ If approved:
   },
   "writer_instructions": "<specific tone or emphasis instructions for the writer>"
 }
- 
+ All flight and hotel prices returned by research tools are assumed to be in USD unless explicitly stated otherwise.
+
+Before approving the plan:
+- Convert USD values to approximate INR.
+- Verify accommodation prices are realistic.
+- Verify total budget calculations use INR consistently.
+- Flag suspicious values below ₹500/night for hotels.
+
 If more research needed:
 {
   "stage": "validation",

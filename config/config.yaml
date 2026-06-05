@@ -1,5 +1,5 @@
 models:
-  primary:
+  groq_llama:
     provider: groq
     model_name: llama-3.3-70b-versatile
     max_tokens: 4096
@@ -8,7 +8,7 @@ models:
     avg_latency_ms: 850
     tier: expensive
 
-  fast:
+  groq_fast:
     provider: groq
     model_name: llama-3.1-8b-instant
     max_tokens: 2048
@@ -17,7 +17,7 @@ models:
     avg_latency_ms: 200
     tier: cheap
 
-  fallback:
+  gemini:
     provider: gemini
     model_name: gemini-2.0-flash
     max_tokens: 8192
@@ -26,10 +26,63 @@ models:
     avg_latency_ms: 600
     tier: cheap
 
+  mistral_medium:
+    provider: mistral
+    model_name: mistral-medium-latest
+    max_tokens: 4096
+    cost_per_1k_input: 0.0004
+    cost_per_1k_output: 0.002
+    avg_latency_ms: 900
+    tier: expensive
+
+  gpt_oss_120b:
+    provider: openai_compatible
+    model_name: openai/gpt-oss-120b:free
+    max_tokens: 8192
+    cost_per_1k_input: 0
+    cost_per_1k_output: 0
+    avg_latency_ms: 1100
+    tier: expensive
+
+node_routing:
+  intake:
+    primary: mistral_medium
+    fallback: [groq_llama]
+  research:
+    primary: groq_llama
+    fallback: [mistral_medium]
+  validator:
+    primary: groq_llama
+    fallback: [mistral_medium]
+  writer:
+    primary: gpt_oss_120b
+    fallback: [mistral_medium]
+  memory:
+    primary: groq_fast
+    fallback: [mistral_medium]
+
 routing_rules:
   use_intent_classifier: true
-  simple_query_model: fast
-  default_model: primary
-  fallback_chain: [primary, fast, fallback]
+  simple_query_model: groq_fast
+  default_model: groq_llama
+  fallback_chain: [groq_llama, groq_fast, gemini]
   latency_threshold_ms: 3000      # switch if p99 > this
   error_threshold_pct: 5          # switch if error rate > 5%
+
+reliability:
+  max_retries: 2
+  base_backoff_seconds: 0.5
+  max_backoff_seconds: 4
+  circuit_cooldown_seconds: 60
+
+memory:
+  recent_message_limit: 8
+  relevant_memory_limit: 5
+  max_memory_text_chars: 600
+  max_memories_per_user: 100
+
+quota:
+  weekly_limits:
+    Pirate: 15
+    Warlord: 50
+    Emperor: 999999

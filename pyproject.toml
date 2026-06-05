@@ -30,4 +30,6 @@ dependencies = [
     "httpx>=0.27.0",
     "slowapi>=0.1.8",
     "aioredis>=2.0.1",
+    "openrouter>=0.9.1",
+    "mistralai>=2.4.9",
 ]

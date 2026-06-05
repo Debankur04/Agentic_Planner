@@ -1,64 +1,68 @@
+import asyncio
 import json
+import re
 import time
 import traceback
-from backend.supabase_client.db_operations import (
-      add_message, see_message, get_conversation_memory, update_conversation_memory,
-      get_preference
-      )
-from llmops.token_tracker import TokenTracker
-from service.cache_service import redis_client
-from llmops.guardrails import *
-from llmops.trace_service import ExecutionTrace
 import uuid
-import asyncio
+
 from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.messages import HumanMessage, SystemMessage
+
 from agent_file.agent.agentic_workflow import AgentRunner, TravelEngine
-from llmops.model_router import ModelRouter
 from agent_file.utils.config_loader import load_config
+from backend.supabase_client.db_operations import add_message, get_preference
+from llmops.guardrails import sanitize_input, validate_llm_output
+from llmops.model_router import ModelRouter
+from llmops.trace_service import ExecutionTrace
+from service.cache_service import redis_client
+from service.context_manager import ContextManager
+from service.quota_service import QuotaService
 
 
 router = ModelRouter(load_config())
 runner = AgentRunner(router)
 travel_engine = TravelEngine(runner)
 
+quota_service = QuotaService(redis_client=redis_client)
+cfg = load_config()
+memory_cfg = cfg.get("memory", {})
+context_manager = ContextManager(
+    recent_limit=int(memory_cfg.get("recent_message_limit", 8)),
+    memory_limit=int(memory_cfg.get("relevant_memory_limit", 5)),
+    max_memory_chars=int(memory_cfg.get("max_memory_text_chars", 600)),
+)
+
+
 def fallback_to_json(raw_output: str):
-    import re, json
-    response = runner.fallback_json_agent(raw_input= raw_output)
-    content = response.content if hasattr(response, 'content') else str(response)
+    response = runner.fallback_json_agent(raw_input=raw_output)
+    content = response.content if hasattr(response, "content") else str(response)
     try:
-        match = re.search(r'\{.*\}', content, re.DOTALL)
+        match = re.search(r"\{.*\}", content, re.DOTALL)
         if match:
             json_str = match.group()
-            json_str = re.sub(r'\\\n', '', json_str)
-            json_str = json_str.replace('\n', '\\n')
+            json_str = re.sub(r"\\\n", "", json_str)
+            json_str = json_str.replace("\n", "\\n")
             parsed = json.loads(json_str)
-            if 'reply' in parsed:
-                return parsed['reply']
+            if "reply" in parsed:
+                return parsed["reply"]
     except Exception:
         pass
-
     return content
+
 
 def process_llm_output(raw_output: str):
     try:
         return validate_llm_output(raw_output)
     except Exception:
-        # 🔥 fallback instead of crashing
         return fallback_to_json(raw_output)
-    
-token_tracker = TokenTracker(redis_client= redis_client)
 
-import re
 
 def clean_llm_output(text: str) -> str:
-    # Remove anything that starts with <function=...>
-    text = re.sub(r"<function=.*?>.*?</function>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<function=.*?>.*?</function>", "", str(text or ""), flags=re.DOTALL)
     text = re.sub(r"<function=.*?>", "", text)
-
-    # Clean up formatting
     text = re.sub(r"\n\s*\n", "\n\n", text)
-
     return text.strip()
+
 
 class QueueCallbackHandler(BaseCallbackHandler):
     def __init__(self, q, loop):
@@ -82,212 +86,57 @@ def chunk_text(text: str, chunk_size: int = 48):
     for start in range(0, len(text), chunk_size):
         yield text[start:start + chunk_size]
 
-async def query_helper_stream(query):
-    # ── Trace bootstrap ──────────────────────────────────────────────────────
-    request_id = f"req_{uuid.uuid4().hex}"
-    trace = ExecutionTrace(request_id=request_id)
+
+def _load_preference(user_id: str, trace: ExecutionTrace) -> str:
     t0 = time.time()
-    trace.record("query_start", {
-        "request_id": request_id,
-        "user_id": query.user_id,
-        "conversation_id": query.conversation_id,
-        "question_preview": query.question[:200]
-    })
-
-    q = asyncio.Queue()
-    loop = asyncio.get_running_loop()
-    callback = QueueCallbackHandler(q, loop)
-
-    async def background_task():
-        try:
-            # ── 1. Budget guard ───────────────────────────────────────────────────
-            if not token_tracker.check_budget(user_id=query.user_id):
-                trace.record("budget_exceeded", {"user_id": query.user_id})
-                loop.call_soon_threadsafe(q.put_nowait, {
-                    "error": {
-                        "message": "Daily Limit Exceeded. Try again tomorrow.",
-                        "code": "budget_exceeded"
-                    },
-                    "trace_id": request_id
-                })
-                return
-
-            # ── 2. Guardrail / input sanitisation ─────────────────────────────────
-            user_query, violation = sanitize_input(query.question)
-            if violation:
-                trace.record("guardrail_violation", {"question_preview": query.question[:200]})
-                loop.call_soon_threadsafe(q.put_nowait, {
-                    "error": {
-                        "message": "Message violation detected",
-                        "code": "guardrail_violation"
-                    },
-                    "trace_id": request_id
-                })
-                return
-
-            trace.record("guardrail_pass", {"sanitised_preview": user_query[:200]})
-
-            # ── 3. Persist user message ───────────────────────────────────────────
-            t_db = time.time()
-            add_message(
-                user_id=query.user_id,
-                conversation_id=query.conversation_id,
-                role='user',
-                content=user_query
-            )
-            trace.record("db_user_message_saved", {}, latency_ms=(time.time()-t_db)*1000)
-
-            # ── 4. Fetch recent history ───────────────────────────────────────────
-            t_hist = time.time()
-            past_messages = see_message(query.conversation_id)
-            history_str = ""
-            for msg in past_messages[-8:]:
-                history_str += f"{msg['role']}: {msg['content']}\n"
-            trace.record("history_fetched", {
-                "message_count": len(past_messages)
-            }, latency_ms=(time.time()-t_hist)*1000)
-
-            # ── 5. Fetch preference ────────────────────────────────────────────────
-            t_pref = time.time()
-            try:
-                pref_data = get_preference(query.user_id)
-                if isinstance(pref_data, list) and len(pref_data) > 0:
-                    preference = json.dumps({
-                        "dietary": pref_data[0].get("dietary_preference"),
-                        "custom": pref_data[0].get("custom_preference")
-                    })
-                else:
-                    preference = ""
-            except:
-                preference = ""
-            trace.record("preference_fetched", {
-                "has_preference": bool(preference)
-            }, latency_ms=(time.time()-t_pref)*1000)
-
-            # ── 6. Fetch memory ───────────────────────────────────────────────────
-            t_mem = time.time()
-            try:
-                memory = get_conversation_memory(query.conversation_id)
-            except:
-                memory = ""
-            trace.record("memory_fetched", {
-                "memory_length": len(memory or "")
-            }, latency_ms=(time.time()-t_mem)*1000)
-
-            # ── 7. Run agent ──────────────────────────────────────────────────────
-            t_agent = time.time()
-            trace.record("agent_call_start", {"request_id": request_id})
-
-            agent_result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    travel_engine.process_query,
-                    user_input=user_query,
-                    history=history_str,
-                    memory=memory,
-                    user_id=query.user_id,
-                    streaming_callback=callback,
-                    conversation_id=query.conversation_id
-                ),
-                timeout=45
-            )
-
-            if isinstance(agent_result, tuple) and len(agent_result) == 4:
-                reply, new_history, is_hitl = agent_result
-            elif isinstance(agent_result, tuple) and len(agent_result) == 3:
-                reply, new_history = agent_result
-                is_hitl = False
-            else:
-                raise ValueError("Agent returned an unexpected response shape")
-
-            if not isinstance(is_hitl, bool):
-                is_hitl = False
-
-            trace.record("agent_call_end", {
-                "reply_preview": str(reply)[:200]
-            }, latency_ms=(time.time()-t_agent)*1000)
-
-            # ── 8. Process / validate output ──────────────────────────────────────
-            t_proc = time.time()
-            if not is_hitl:
-                reply = process_llm_output(reply)
-                final_output = clean_llm_output(reply)
-            else:
-                final_output = reply  # Question is already clean
-            trace.record("output_processed", {
-                "final_reply_preview": str(final_output)[:200]
-            }, latency_ms=(time.time()-t_proc)*1000)
-
-            # ── 9. Persist assistant response ─────────────────────────────────────
-            t_save = time.time()
-            reply_text = final_output
-            add_message(
-                user_id=query.user_id,
-                conversation_id=query.conversation_id,
-                role='assistant',
-                content=reply_text
-            )
-            trace.record("db_assistant_message_saved", {}, latency_ms=(time.time()-t_save)*1000)
-
-            # ── 10. Update memory ─────────────────────────────────────────────────
-            if not is_hitl:
-                try:
-                    t_mupd = time.time()
-                    updated_memory = f"{memory}\nUser: {user_query}\nAssistant: {final_output}"
-                    updated_memory = updated_memory[-2000:]
-                    update_conversation_memory(query.conversation_id, updated_memory)
-                    trace.record("memory_updated", {}, latency_ms=(time.time()-t_mupd)*1000)
-                except Exception as e:
-                    trace.record("memory_update_failed", {"error": str(e)})
-
-            trace.record("final_response", {
-                "request_id": request_id,
-                "answer_preview": str(final_output)
-            }, latency_ms=(time.time()-t0)*1000)
-
-            for chunk in chunk_text(reply_text):
-                await q.put(chunk)
-                await asyncio.sleep(0.005)
-            
-            # Send final structured chunk (optional but good for clients to know it's done)
-            await q.put({"final_reply": reply_text, "trace_id": request_id})
-
-        except Exception as e:
-            tb = traceback.format_exc()
-            print(f"[query_controller] stream workflow failed: {e}\n{tb}")
-            trace.record("query_error", {"error": str(e), "traceback": tb}, latency_ms=(time.time()-t0)*1000)
-            loop.call_soon_threadsafe(q.put_nowait, {
-                "error": {
-                    "message": "Workflow failed during execution",
-                    "details": str(e),
-                    "traceback": tb
-                },
-                "trace_id": request_id
+    try:
+        pref_data = get_preference(user_id)
+        if isinstance(pref_data, list) and pref_data:
+            preference = json.dumps({
+                "dietary": pref_data[0].get("dietary_preference"),
+                "custom": pref_data[0].get("custom_preference"),
             })
-        finally:
-            try:
-                trace.save_to_redis(redis_client)
-                trace.save_to_db()
-            except Exception:
-                pass
-            loop.call_soon_threadsafe(q.put_nowait, None) # EOF
-
-    asyncio.create_task(background_task())
-
-    while True:
-        item = await q.get()
-        if item is None:
-            break
-        if isinstance(item, Exception):
-            yield f"data: {json.dumps({'error': str(item)})}\n\n"
-            break
-        if isinstance(item, dict):
-            # E.g. {"error": ...} or {"final_reply": ...}
-            yield f"data: {json.dumps(item)}\n\n"
         else:
-            yield f"data: {json.dumps({'type': 'chunk', 'content': item})}\n\n"
+            preference = ""
+    except Exception as exc:
+        preference = ""
+        trace.record("preference_fetch_failed", {"error": str(exc)})
+    trace.record("preference_fetched", {"has_preference": bool(preference)}, latency_ms=(time.time() - t0) * 1000)
+    return preference
+
+
+def _extract_durable_memory(user_query: str, final_output: str, trace: ExecutionTrace) -> str:
+    fallback = (
+        f"User query: {user_query}\n"
+        f"Durable assistant summary: {str(final_output)[:500]}"
+    )
+    prompt = [
+        SystemMessage(content=(
+            "Extract only durable travel-planning memory from the exchange. "
+            "Keep reusable preferences, constraints, accessibility needs, budget style, food preferences, "
+            "home/base city, and recurring travel patterns. "
+            "Do not store one-off itinerary details, prices, transient dates, or tool results. "
+            "Return a concise plain-text bullet list. Return an empty string if there is no durable memory."
+        )),
+        HumanMessage(content=f"User query:\n{user_query}\n\nFinal assistant response:\n{final_output}"),
+    ]
+    try:
+        response = runner.graph_builder.gateway.invoke_node(
+            node_name="memory",
+            prompt_messages=prompt,
+            tools=[],
+            trace=trace,
+        )
+        extracted = str(getattr(response, "content", "")).strip()
+        if extracted and extracted.lower() not in {"none", "no durable memory", "empty"}:
+            trace.record("memory_extraction_completed", {"memory_length": len(extracted)})
+            return extracted
+    except Exception as exc:
+        trace.record("memory_extraction_failed", {"error": str(exc)})
+    return fallback
+
 
 async def query_helper(query):
-    # ── Trace bootstrap ──────────────────────────────────────────────────────
     request_id = f"req_{uuid.uuid4().hex}"
     trace = ExecutionTrace(request_id=request_id)
     t0 = time.time()
@@ -295,168 +144,128 @@ async def query_helper(query):
         "request_id": request_id,
         "user_id": query.user_id,
         "conversation_id": query.conversation_id,
-        "question_preview": query.question[:200]
+        "question_preview": query.question[:200],
     })
 
+    quota_reserved = False
     try:
-        # ── 1. Budget guard ───────────────────────────────────────────────────
-        if not token_tracker.check_budget(user_id=query.user_id):
-            trace.record("budget_exceeded", {"user_id": query.user_id})
-            return {
-                "error": {
-                    "message": "Daily Limit Exceeded. Try again tomorrow.",
-                    "code": "budget_exceeded"
-                },
-                "trace_id": request_id
-            }
-
-        # ── 2. Guardrail / input sanitisation ─────────────────────────────────
         user_query, violation = sanitize_input(query.question)
         if violation:
             trace.record("guardrail_violation", {"question_preview": query.question[:200]})
             return {
-                "error": {
-                    "message": "Message violation detected",
-                    "code": "guardrail_violation"
-                },
-                "trace_id": request_id
+                "error": {"message": "Message violation detected", "code": "guardrail_violation"},
+                "trace_id": request_id,
             }
-
         trace.record("guardrail_pass", {"sanitised_preview": user_query[:200]})
 
-        # ── 3. Persist user message ───────────────────────────────────────────
-        t_db = time.time()
-        add_message(
+        quota_status = quota_service.check_and_reserve_message(query.user_id, request_id)
+        quota_reserved = quota_status.allowed
+        trace.record("quota_checked", quota_status.to_dict())
+        if not quota_status.allowed:
+            return {
+                "error": {
+                    "message": quota_status.message or "Weekly message quota exceeded.",
+                    "code": "quota_exceeded",
+                    "quota": quota_status.to_dict(),
+                },
+                "trace_id": request_id,
+            }
+
+        preference = _load_preference(query.user_id, trace)
+
+        t_ctx = time.time()
+        context_bundle = context_manager.build_context_bundle(
             user_id=query.user_id,
             conversation_id=query.conversation_id,
-            role='user',
-            content=user_query
+            current_query=user_query,
+            trace=trace,
         )
-        trace.record("db_user_message_saved", {}, latency_ms=(time.time()-t_db)*1000)
+        trace.record("context_bundle_built", {
+            "recent_message_count": len(context_bundle.get("recent_messages", [])),
+            "relevant_memory_length": len(context_bundle.get("relevant_memory", "")),
+        }, latency_ms=(time.time() - t_ctx) * 1000)
 
-        # ── 4. Fetch recent history ───────────────────────────────────────────
-        t_hist = time.time()
-        past_messages = see_message(query.conversation_id)
-        history_str = ""
-        for msg in past_messages[-8:]:
-            history_str += f"{msg['role']}: {msg['content']}\n"
-        trace.record("history_fetched", {
-            "message_count": len(past_messages)
-        }, latency_ms=(time.time()-t_hist)*1000)
+        t_db = time.time()
+        add_message(query.user_id, query.conversation_id, "user", user_query)
+        trace.record("db_user_message_saved", {}, latency_ms=(time.time() - t_db) * 1000)
 
-        # ── 5. Fetch preference ────────────────────────────────────────────────
-        t_pref = time.time()
-        try:
-            pref_data = get_preference(query.user_id)
-            if isinstance(pref_data, list) and len(pref_data) > 0:
-                preference = json.dumps({
-                    "dietary": pref_data[0].get("dietary_preference"),
-                    "custom": pref_data[0].get("custom_preference")
-                })
-            else:
-                preference = ""
-        except:
-            preference = ""
-        trace.record("preference_fetched", {
-            "has_preference": bool(preference)
-        }, latency_ms=(time.time()-t_pref)*1000)
-
-        # ── 6. Fetch memory ───────────────────────────────────────────────────
-        t_mem = time.time()
-        try:
-            memory = get_conversation_memory(query.conversation_id)
-        except:
-            memory = ""
-        trace.record("memory_fetched", {
-            "memory_length": len(memory or "")
-        }, latency_ms=(time.time()-t_mem)*1000)
-
-        # ── 7. Run agent ──────────────────────────────────────────────────────
         t_agent = time.time()
         trace.record("agent_call_start", {"request_id": request_id})
-
-        reply, new_history, is_hitl = await asyncio.wait_for(
+        reply, _new_history, is_hitl = await asyncio.wait_for(
             asyncio.to_thread(
                 travel_engine.process_query,
                 user_input=user_query,
-                history=history_str,
-                memory=memory,
-                user_id=query.user_id
+                preference=preference,
+                history=context_bundle.get("recent_messages_text", ""),
+                memory=context_bundle.get("relevant_memory", ""),
+                user_id=query.user_id,
+                conversation_id=query.conversation_id,
+                context_bundle=context_bundle,
+                user_tier=quota_status.tier,
             ),
-            timeout=30
+            timeout=145,
         )
+        trace.record("agent_call_end", {"reply_preview": str(reply)[:200]}, latency_ms=(time.time() - t_agent) * 1000)
 
-        trace.record("agent_call_end", {
-            "reply_preview": str(reply)[:200]
-        }, latency_ms=(time.time()-t_agent)*1000)
-
-        # ── 8. Process / validate output ──────────────────────────────────────
         t_proc = time.time()
-        if not is_hitl:
-            print(reply)
-            reply = process_llm_output(reply)
-            final_output = clean_llm_output(reply)
-        else:
-            final_output = reply
-            
-        trace.record("output_processed", {
-            "final_reply_preview": str(final_output)[:200]
-        }, latency_ms=(time.time()-t_proc)*1000)
+        final_output = reply if is_hitl else clean_llm_output(process_llm_output(reply))
+        trace.record("output_processed", {"final_reply_preview": str(final_output)[:200]}, latency_ms=(time.time() - t_proc) * 1000)
 
-        # ── 9. Persist assistant response ─────────────────────────────────────
-        # Extract only the reply text — we do NOT store the full dict in the DB.
-        # Storing a dict would cause Pydantic errors when /see_message tries to read it back.
         t_save = time.time()
-        reply_text = final_output
-        add_message(
-            user_id=query.user_id,
-            conversation_id=query.conversation_id,
-            role='assistant',
-            content=reply_text  # Always a plain string
-        )
-        trace.record("db_assistant_message_saved", {}, latency_ms=(time.time()-t_save)*1000)
+        add_message(query.user_id, query.conversation_id, "assistant", final_output)
+        trace.record("db_assistant_message_saved", {}, latency_ms=(time.time() - t_save) * 1000)
 
-        # ── 10. Update memory ─────────────────────────────────────────────────
         if not is_hitl:
-            try:
-                t_mupd = time.time()
-                updated_memory = f"{memory}\nUser: {user_query}\nAssistant: {final_output}"
-                updated_memory = updated_memory[-2000:]   # prevent explosion
-                update_conversation_memory(query.conversation_id, updated_memory)
-                trace.record("memory_updated", {}, latency_ms=(time.time()-t_mupd)*1000)
-            except Exception as e:
-                trace.record("memory_update_failed", {"error": str(e)})
-                print("Memory update failed:", e)
+            t_mem = time.time()
+            durable_memory = _extract_durable_memory(user_query, final_output, trace)
+            context_manager.store_memory(
+                user_id=query.user_id,
+                conversation_id=query.conversation_id,
+                memory_text=durable_memory,
+                tags=["travel", quota_status.tier],
+                importance=1,
+                trace=trace,
+            )
+            context_manager.prune_user_memories(query.user_id, trace=trace)
+            trace.record("memory_processing_completed", {}, latency_ms=(time.time() - t_mem) * 1000)
 
-        # ── 11. Final controller response trace ───────────────────────────────
+        quota_service.commit_message_usage(query.user_id, request_id)
+        quota_reserved = False
         trace.record("final_response", {
             "request_id": request_id,
-            "answer_preview": str(final_output)
-        }, latency_ms=(time.time()-t0)*1000)
+            "answer_preview": str(final_output)[:300],
+        }, latency_ms=(time.time() - t0) * 1000)
 
-        # Return just the reply string — the frontend reads data.reply
-        return {"reply": reply_text, "trace_id": request_id}
+        return {"reply": final_output, "trace_id": request_id}
 
-    except Exception as e:
+    except Exception as exc:
+        if quota_reserved:
+            quota_service.rollback_reservation(query.user_id, request_id)
         tb = traceback.format_exc()
-        print(f"[query_controller] query workflow failed: {e}\n{tb}")
-        trace.record("query_error", {
-            "error": str(e),
-            "traceback": tb
-        }, latency_ms=(time.time()-t0)*1000)
+        print(f"[query_controller] query workflow failed: {exc}\n{tb}")
+        trace.record("query_error", {"error": str(exc), "traceback": tb}, latency_ms=(time.time() - t0) * 1000)
         return {
             "error": {
                 "message": "Workflow failed during execution",
-                "details": str(e),
-                "traceback": tb
+                "details": str(exc),
             },
-            "trace_id": request_id
+            "trace_id": request_id,
         }
-
     finally:
-        # Always persist trace regardless of success / failure
         try:
             trace.save_to_redis(redis_client)
             trace.save_to_db()
-        except Exception as te:
-            print(f"Trace save failed: {te}")
+        except Exception as trace_exc:
+            print(f"Trace save failed: {trace_exc}")
+
+
+async def query_helper_stream(query):
+    result = await query_helper(query)
+    if isinstance(result, dict) and "error" in result:
+        yield f"data: {json.dumps(result)}\n\n"
+        return
+    reply_text = result.get("reply", "") if isinstance(result, dict) else ""
+    for chunk in chunk_text(reply_text):
+        yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
+        await asyncio.sleep(0.005)
+    yield f"data: {json.dumps({'final_reply': reply_text, 'trace_id': result.get('trace_id')})}\n\n"
