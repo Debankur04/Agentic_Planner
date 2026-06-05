@@ -15,9 +15,7 @@ from Schema import *
 import logging
 import uuid
 from backend.supabase_client.auth import *
-from backend.supabase_client.db_operations import (
-    create_conversation, delete_conversation, see_conversation,see_message,
-    upsert_preference, remove_preference, get_preference)
+from backend.supabase_client.db_operations import (create_conversation, delete_conversation, see_conversation,see_message,upsert_preference, remove_preference, get_preference)
 from llmops.guardrails import *
 from llmops.token_tracker import TokenTracker
 from dotenv import load_dotenv
@@ -27,11 +25,11 @@ from backend.mongo import get_trace_from_db
 from backend.controller.query_controller import query_helper, router as query_router
 from backend.controller.query_controller import quota_service
 from service.billing_service import BillingService
+from service.emperor import emperor_key
 
 load_dotenv()
 
 app = FastAPI()
-
 
 class SafeRequestIdFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
@@ -426,3 +424,8 @@ async def get_trace(request: Request, request_id: str):
     return trace
 
 
+#------- Emperor APIS -------#
+@app.get("/emperor_set")
+@limiter.limit("10/minute")
+async def emperor_set(request:Request, query: Emperor_Key ,user=Depends(verify_token)):
+    return emperor_key(email= query.email,amount= query.amount,password= query.password)

@@ -1,8 +1,6 @@
 from langchain_core.messages import SystemMessage, ToolMessage, HumanMessage
 import json
 from langgraph.graph import StateGraph, MessagesState, END, START, add_messages
-from langgraph.checkpoint.memory import MemorySaver
-from langchain_core.tools import tool
 from langchain_core.messages import AIMessage
 from llmops.token_tracker import *
 from agent_file.utils.model_loader import *
@@ -13,7 +11,6 @@ import time
 import logging
 from agent_file.prompt_library.multi_agent_prompts import build_intake_prompt, build_research_prompt, build_writer_prompt
 
-# ✅ Tools
 from agent_file.tools.flight_search import get_flight_search_tool
 from agent_file.tools.hotel_search import get_hotel_search_tool
 from agent_file.tools.place_search_tool import get_place_search_tools
@@ -25,20 +22,13 @@ import concurrent.futures
 from llmops.trace_service import ExecutionTrace
 from agent_file.prompt_library.prompt_maker import fallback_json
 from llmops.reliable_gateway import ReliableModelGateway, ModelInvocationError
+import contextvars
 
 logger = logging.getLogger(__name__)
 token_tracker = TokenTracker(redis_client=redis_client)
 
-
-# @tool
-# def ask_human(question: str) -> str:
-#     """Ask the user a question to clarify one of these missing critical fields only: source city, budget, start date, or tenure."""
-#     return question
-
 def merge_dicts(left: dict, right: dict) -> dict:
     return {**left, **right}
-
-import contextvars
 
 def run_with_timeout(app, input_data, config):
     ctx = contextvars.copy_context()
@@ -48,7 +38,6 @@ def run_with_timeout(app, input_data, config):
             return future.result(timeout=120)
         except concurrent.futures.TimeoutError:
             raise HTTPException(408, detail="Request timeout (120s)")
-
 
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
@@ -60,10 +49,6 @@ class AgentState(TypedDict):
     context_bundle: dict
     user_tier: str
 
-    # Optional values may be added by workflow nodes
-    # such as thread ids, tool results, and state metadata.
-
-    # NOTE: langgraph requires a typed state schema for compile-time validation.
 
 
 class GraphBuilder:
@@ -77,7 +62,6 @@ class GraphBuilder:
         get_current_weather, get_weather_forecast = get_weather_tools()
         find_routes, estimate_delay, live_train_update, get_schedule, get_code_station = get_railway_search_tool()
 
-        # self.intake_tools = [ask_human]
         self.intake_tools = []
         self.research_tools = [
             find_flights,
@@ -738,9 +722,6 @@ class TravelEngine:
         return reply, history, is_hitl
 
     def _parse_response(self, response):
-        # Previously we attempted to auto-parse JSON here. Keep the response as-is
-        # since LLMs will emit JSON when required and downstream consumers
-        # can handle string or dict accordingly.
         return response
 
     def _extract_reply(self, content):

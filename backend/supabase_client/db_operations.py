@@ -1,6 +1,7 @@
 from typing import List, Dict
 from backend.supabase_client.supabase_init import supabase_admin
 from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 
 # ------------------ PREFERENCES ------------------ #
@@ -285,3 +286,148 @@ def add_conversation_memory(conversation_id: str, memory: str = ""):
 
     except Exception as e:
         raise RuntimeError(f"[ADD MEMORY FAILED] {str(e)}") from e
+    
+
+def get_user_id_from_email(email: str):
+    try:
+        users = supabase_admin.auth.admin.list_users()
+
+        for user in users:
+            if user.email and user.email.lower() == email.lower():
+                return {
+                    "success": True,
+                    "user_id": user.id,
+                    "email": user.email,
+                }
+
+        return {
+            "success": False,
+            "message": f"No user found with email {email}",
+        }
+
+    except Exception as e:
+        print(f"[GET_USER_BY_EMAIL_FAILED] {e}")
+
+        return {
+            "success": False,
+            "message": str(e),
+        }
+
+
+
+
+def create_warlord_plan(
+    user_id: str,
+    amount_paid: int = 99,
+    weekly_limit: int = 50,
+):
+    try:
+        now = datetime.now(timezone.utc)
+
+        payload = {
+            "user_id": user_id,
+            "tier": "Warlord",
+            "weekly_limit": weekly_limit,
+            "billing_status": "active",
+            "monthly_price": amount_paid,
+            "custom_message_limit": None,
+            "subscription_source": "manual",
+            "patreon_email": None,
+            "current_period_start": now.isoformat(),
+            "current_period_end": (now + timedelta(days=30)).isoformat(),
+            "subscription_start_date": now.isoformat(),
+            "subscription_expiry_date": (now + timedelta(days=30)).isoformat(),
+            "last_billed_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+        }
+
+        existing = (
+            supabase_admin
+            .table("user_plans")
+            .select("user_id")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+
+        rows = existing.data or []
+
+        if rows:
+            result = (
+                supabase_admin
+                .table("user_plans")
+                .update(payload)
+                .eq("user_id", user_id)
+                .execute()
+            )
+        else:
+            result = (
+                supabase_admin
+                .table("user_plans")
+                .insert(payload)
+                .execute()
+            )
+
+        return {
+            "success": True,
+            "message": "Warlord plan activated successfully",
+            "data": result.data,
+        }
+
+    except Exception as e:
+        print(f"[CREATE_WARLORD_PLAN_FAILED] {e}")
+
+        return {
+            "success": False,
+            "message": str(e),
+        }
+    
+def create_emperor_billing_transaction(
+    user_id: str,
+    amount: int,
+    provider: str = "manual",
+    currency: str = "INR",
+):
+    """
+    Create a billing transaction for an Emperor purchase.
+
+    Args:
+        user_id: Supabase user UUID
+        amount: Amount paid in INR
+        provider: manual / patreon / admin
+        currency: INR by default
+
+    Returns:
+        dict
+    """
+
+    try:
+        response = (
+            supabase_admin
+            .table("billing_transactions")
+            .insert({
+                "user_id": user_id,
+                "provider": provider,
+                "amount": amount,
+                "currency": currency,
+                "status": "paid",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+
+                # legacy razorpay columns
+                "razorpay_order_id": None,
+                "razorpay_payment_id": None,
+            })
+            .execute()
+        )
+
+        return {
+            "success": True,
+            "message": "Billing transaction created successfully.",
+            "data": response.data,
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Failed to create billing transaction: {str(e)}",
+        }

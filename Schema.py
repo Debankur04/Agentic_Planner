@@ -168,3 +168,8 @@ class SimpleResponse(BaseModel):
 
 class SeePreferenceRequest(BaseModel):
     user_id: str
+
+class Emperor_Key(BaseModel):
+    email: str
+    amount: int
+    password: str
