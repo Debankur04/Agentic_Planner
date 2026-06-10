@@ -10,7 +10,7 @@ from backend.supabase_client.db_operations import (
 load_dotenv()
 
 ADMIN_PLAN_PASSWORD = os.getenv("ADMIN_PLAN_PASSWORD")
-EMPEROR_COST_PER_REQUEST = int(
+EMPEROR_COST_PER_REQUEST = float(
     os.getenv("EMPEROR_COST_PER_REQUEST", "1")
 )
 
