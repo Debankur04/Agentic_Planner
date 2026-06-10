@@ -12,6 +12,7 @@
 
 [Architecture](#architecture) · [Multi-Agent System](#multi-agent-system) · [API Reference](#api-reference) · [Setup](#setup) · [Deployment](#deployment)
 
+
 ---
 
 ## Overview
@@ -47,18 +48,18 @@ Beyond the agent layer, the system implements a production LLMOps control plane 
 │              FastAPI Gateway  (main.py)                       │
 │  Auth middleware · Rate limiter (slowapi) · Request ID        │
 │  Input sanitizer · Schema validator · Budget gate             │
-└────────────────────────────┬──────────────────────────────────┘
-                             │
-┌────────────────────────────▼──────────────────────────────────┐
+└───────────────────────────┬───────────────────────────────────┘
+                            │
+┌───────────────────────────▼───────────────────────────────────┐
 │                   LLMOps Control Plane                        │
 │                                                               │
 │   Model Router ──── Prompt Registry ──── Token Tracker        │
 │   (cost/latency)    (versioned)          (Redis quotas)       │
 │                                                               │
 │              Observability Bus (structured logs)              │
-└────────────────────────────┬──────────────────────────────────┘
-                             │
-┌────────────────────────────▼──────────────────────────────────┐
+└───────────────────────────┬───────────────────────────────────┘
+                            │
+┌───────────────────────────▼───────────────────────────────────┐
 │             Multi-Agent Execution Engine                      │
 │                                                               │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐         │
@@ -70,14 +71,14 @@ Beyond the agent layer, the system implements a production LLMOps control plane 
 │                           ▼                                   │
 │              CommunicationManager (target.js)                 │
 │              TraceRecorder (45+ event types)                  │
-└────────────────────────────┬──────────────────────────────────┘
-                             │
-┌────────────────────────────▼──────────────────────────────────┐
+└───────────────────────────┬───────────────────────────────────┘
+                            │
+┌───────────────────────────▼───────────────────────────────────┐
 │                    Tool Ecosystem                             │
 │  Flights · Hotels · Weather · Places · Railways               │
-└────────────────────────────┬──────────────────────────────────┘
-                             │
-┌────────────────────────────▼──────────────────────────────────┐
+└───────────────────────────┬───────────────────────────────────┘
+                            │
+┌───────────────────────────▼───────────────────────────────────┐
 │              Data & Persistence Layer                         │
 │  Supabase (auth, conversations, preferences, memory)          │
 │  Redis (cache, tracing, token budgets)                        │
