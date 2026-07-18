@@ -1,0 +1,53 @@
+{
+  "app": {
+    "homepage_url": "https://logpose-ai.vercel.app",
+    "pricing_url": "https://logpose-ai.vercel.app/plans"
+  },
+  "products": [
+    {
+      "tier": "warlord",
+      "name": "LogPose AI Warlord",
+      "description": "50 AI travel-planning messages per week, advanced models, and priority support.",
+      "prices": [
+        {
+          "nickname": "India",
+          "currency": "INR",
+          "unit_amount": 9900,
+          "interval": "month",
+          "region": "IN",
+          "type": "one_time"
+        },
+        {
+          "nickname": "India Autopay",
+          "currency": "INR",
+          "unit_amount": 9900,
+          "interval": "month",
+          "region": "IN",
+          "type": "recurring"
+        },
+        {
+          "nickname": "Global",
+          "currency": "USD",
+          "unit_amount": 199,
+          "interval": "month",
+          "type": "one_time"
+        }
+      ]
+    },
+    {
+      "tier": "emperor",
+      "name": "LogPose AI Emperor",
+      "description": "Custom quota, team workflows, and dedicated support for larger travel operations.",
+      "prices": [
+        {
+          "nickname": "India Custom",
+          "currency": "INR",
+          "unit_amount": 99900,
+          "interval": "month",
+          "region": "IN",
+          "type": "one_time"
+        }
+      ]
+    }
+  ]
+}

@@ -1,8 +1,3 @@
-import hmac
-from hashlib import sha256
-from types import SimpleNamespace
-from unittest.mock import Mock
-
 from llmops.model_router import ModelRouter
 from service.billing_service import BillingService
 from service.quota_service import QuotaService
@@ -58,19 +53,27 @@ def test_quota_reservations_count_against_limit(monkeypatch):
     assert second.message == "Weekly message quota exceeded."
 
 
-def test_razorpay_order_signature_verification():
+def test_elixpo_checkout_uses_live_catalog_url(monkeypatch):
     service = BillingService()
-    service.key_secret = "secret"
-    order_id = "order_123"
-    payment_id = "pay_123"
-    signature = hmac.new(
-        service.key_secret.encode(),
-        f"{order_id}|{payment_id}".encode(),
-        sha256,
-    ).hexdigest()
+    monkeypatch.setattr(service, "get_live_catalog", lambda: {
+        "products": [
+            {
+                "tier": "warlord",
+                "prices": [
+                    {
+                        "region": "IN",
+                        "type": "recurring",
+                        "checkout_url": "https://payouts.elixpo.com/checkout/test",
+                    }
+                ],
+            }
+        ]
+    })
 
-    assert service.verify_signature(order_id, payment_id, signature)
-    assert not service.verify_signature(order_id, payment_id, "bad")
+    handoff = service.create_checkout_handoff("user1", tier="warlord")
+
+    assert handoff["provider"] == "elixpo_pay"
+    assert handoff["checkout_url"] == "https://payouts.elixpo.com/checkout/test"
 
 
 def test_model_router_uses_node_primary():

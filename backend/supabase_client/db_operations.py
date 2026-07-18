@@ -413,7 +413,6 @@ def create_emperor_billing_transaction(
                 "status": "paid",
                 "created_at": datetime.now(timezone.utc).isoformat(),
 
-                # legacy razorpay columns
                 "razorpay_order_id": None,
                 "razorpay_payment_id": None,
             })

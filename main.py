@@ -5,6 +5,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 import json
 import asyncio
 import re
+import os
 from contextvars import ContextVar
 from agent_file.agent.agentic_workflow import GraphBuilder
 from slowapi import Limiter
@@ -314,42 +315,48 @@ async def quota_status_api(request: Request, user_id: str = Query(...), user=Dep
     return quota_service.get_status(user_id).to_dict()
 
 
-@app.post("/billing/razorpay/order")
+@app.get("/billing/elixpo/catalog")
 @limiter.limit("20/minute")
-async def create_razorpay_order_api(request: Request, query: BillingOrderRequest, user=Depends(verify_token)):
+async def get_elixpo_catalog_api(request: Request):
     try:
-        return billing_service.create_warlord_order(query.user_id)
+        return billing_service.get_live_catalog()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/billing/razorpay/verify")
+@app.post("/billing/elixpo/checkout")
 @limiter.limit("20/minute")
-async def verify_razorpay_payment_api(request: Request, query: BillingVerifyRequest, user=Depends(verify_token)):
+async def create_elixpo_checkout_api(request: Request, query: BillingCheckoutRequest, user=Depends(verify_token)):
     try:
-        return billing_service.verify_warlord_payment(
+        return billing_service.create_checkout_handoff(
             user_id=query.user_id,
-            order_id=query.razorpay_order_id or "",
-            payment_id=query.razorpay_payment_id,
-            signature=query.razorpay_signature,
-            subscription_id=query.razorpay_subscription_id or "",
+            tier=query.tier or "warlord",
+            region=query.region or "IN",
+            recurring=query.recurring if query.recurring is not None else True,
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/billing/razorpay/webhook")
-@limiter.limit("100/minute")
-async def razorpay_webhook_api(request: Request):
-    raw_body = await request.body()
-    signature = request.headers.get("X-Razorpay-Signature", "")
-    if not billing_service.verify_webhook_signature(raw_body, signature):
-        raise HTTPException(status_code=400, detail="Invalid Razorpay webhook signature")
+@app.post("/billing/elixpo/sync-catalog")
+@limiter.limit("5/minute")
+async def sync_elixpo_catalog_api(request: Request, query: BillingSyncRequest, user=Depends(verify_token)):
+    admin_password = os.getenv("ADMIN_PLAN_PASSWORD", "")
+    if admin_password and query.password != admin_password:
+        raise HTTPException(status_code=403, detail="Invalid admin password")
     try:
-        payload = json.loads(raw_body.decode("utf-8"))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid webhook JSON")
-    return billing_service.handle_webhook_event(payload)
+        return billing_service.sync_catalog()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/billing/demo/activate-warlord")
+@limiter.limit("5/minute")
+async def activate_demo_warlord_api(request: Request, query: DemoEntitlementRequest, user=Depends(verify_token)):
+    try:
+        return billing_service.activate_demo_warlord(query.user_id, query.activation_code)
+    except Exception as e:
+        raise HTTPException(status_code=403, detail=str(e))
 
 
 @app.post("/billing/emperor/request", response_model=SimpleResponse)

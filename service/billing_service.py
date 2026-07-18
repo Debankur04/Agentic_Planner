@@ -1,8 +1,8 @@
-import base64
-import hmac
+import json
 import os
 from datetime import datetime, timedelta, timezone
-from hashlib import sha256
+from pathlib import Path
+from urllib.parse import urlencode
 
 import requests
 
@@ -10,147 +10,90 @@ from backend.supabase_client.supabase_init import supabase_admin
 
 
 class BillingService:
-    WARLORD_AMOUNT_INR = 99
-    WARLORD_AMOUNT_PAISE = 9900
+    """Elixpo Pay catalog and billing handoff integration."""
+
+    DEFAULT_BASE_URL = "https://payouts.elixpo.com"
+    DEFAULT_APP_ID = "logpose-ai"
+    DEFAULT_CATALOG_PATH = Path(__file__).resolve().parents[1] / "payouts.catalog.json"
 
     def __init__(self):
-        self.key_id = os.getenv("RAZORPAY_KEY_ID", "")
-        self.key_secret = os.getenv("RAZORPAY_KEY_SECRET", "")
-        self.warlord_plan_id = os.getenv("RAZORPAY_WARLORD_PLAN_ID", "")
-        self.currency = "INR"
+        self.base_url = os.getenv("ELIXPO_PAY_BASE_URL", self.DEFAULT_BASE_URL).rstrip("/")
+        self.api_key = os.getenv("ELIXPO_PAY_API_KEY", "")
+        self.app_id = os.getenv("ELIXPO_PAY_APP_ID", self.DEFAULT_APP_ID)
+        self.product_page_url = os.getenv("ELIXPO_PAY_PRODUCT_PAGE_URL", "")
+        self.catalog_path = Path(os.getenv("ELIXPO_PAY_CATALOG_PATH", str(self.DEFAULT_CATALOG_PATH)))
 
-    def _auth_header(self) -> str:
-        token = base64.b64encode(f"{self.key_id}:{self.key_secret}".encode()).decode()
-        return f"Basic {token}"
+    def load_local_catalog(self) -> dict:
+        with self.catalog_path.open("r", encoding="utf-8") as catalog_file:
+            return json.load(catalog_file)
 
-    def create_warlord_order(self, user_id: str) -> dict:
-        if not self.key_id or not self.key_secret:
-            raise RuntimeError("Razorpay credentials are not configured")
+    def sync_catalog(self) -> dict:
+        if not self.api_key:
+            raise RuntimeError("ELIXPO_PAY_API_KEY is not configured")
 
-        if self.warlord_plan_id:
-            payload = {
-                "plan_id": self.warlord_plan_id,
-                "total_count": 12,
-                "quantity": 1,
-                "notes": {"user_id": user_id, "tier": "Warlord"},
-            }
-            response = requests.post(
-                "https://api.razorpay.com/v1/subscriptions",
-                json=payload,
-                headers={"Authorization": self._auth_header(), "Content-Type": "application/json"},
-                timeout=15,
-            )
-            response.raise_for_status()
-            subscription = response.json()
-            self.record_transaction(
-                user_id=user_id,
-                order_id=subscription["id"],
-                payment_id="",
-                status="subscription_created",
-                amount=self.WARLORD_AMOUNT_PAISE,
-            )
-            return {
-                "subscription_id": subscription["id"],
-                "key_id": self.key_id,
-                "amount": self.WARLORD_AMOUNT_PAISE,
-                "currency": self.currency,
-                "tier": "Warlord",
-            }
-
-        receipt = f"warlord_{user_id}_{int(datetime.now(timezone.utc).timestamp())}"
-        payload = {
-            "amount": self.WARLORD_AMOUNT_PAISE,
-            "currency": self.currency,
-            "receipt": receipt,
-            "notes": {"user_id": user_id, "tier": "Warlord"},
-        }
+        catalog = self.load_local_catalog()
         response = requests.post(
-            "https://api.razorpay.com/v1/orders",
-            json=payload,
-            headers={"Authorization": self._auth_header(), "Content-Type": "application/json"},
+            f"{self.base_url}/v1/sync",
+            json=catalog,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=20,
+        )
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError("Elixpo Pay sync returned invalid JSON") from exc
+
+        errors = payload.get("errors") or []
+        if not response.ok or payload.get("ok") is False or errors:
+            raise RuntimeError(f"Elixpo Pay catalog sync failed: {errors or payload}")
+
+        return payload
+
+    def get_live_catalog(self) -> dict:
+        response = requests.get(
+            f"{self.base_url}/v1/catalog",
+            params={"app": self.app_id},
             timeout=15,
         )
         response.raise_for_status()
-        order = response.json()
+        return response.json()
 
-        self.record_transaction(
-            user_id=user_id,
-            order_id=order["id"],
-            payment_id="",
-            status="created",
-            amount=self.WARLORD_AMOUNT_PAISE,
-        )
+    def create_checkout_handoff(self, user_id: str, tier: str = "warlord", region: str = "IN", recurring: bool = True) -> dict:
+        catalog = self.get_live_catalog()
+        tier_key = tier.strip().lower()
+        product = self._find_product(catalog, tier_key)
+        if not product:
+            raise RuntimeError(f"Elixpo Pay product tier '{tier_key}' was not found in the live catalog")
+
+        price = self._find_price(product, region=region, recurring=recurring)
+        checkout_url = self._extract_checkout_url(product, price)
+        if not checkout_url:
+            checkout_url = self._fallback_product_url(tier_key, user_id)
+
         return {
-            "order_id": order["id"],
-            "key_id": self.key_id,
-            "amount": self.WARLORD_AMOUNT_PAISE,
-            "currency": self.currency,
-            "tier": "Warlord",
+            "provider": "elixpo_pay",
+            "checkout_url": checkout_url,
+            "tier": product.get("tier") or tier_key,
+            "product": product,
+            "price": price or {},
         }
 
-    def verify_signature(self, order_id: str, payment_id: str, signature: str, subscription_id: str = "") -> bool:
-        if subscription_id:
-            message = f"{payment_id}|{subscription_id}".encode()
-        else:
-            message = f"{order_id}|{payment_id}".encode()
-        expected = hmac.new(self.key_secret.encode(), message, sha256).hexdigest()
-        return hmac.compare_digest(expected, signature or "")
-
-    def verify_webhook_signature(self, raw_body: bytes, signature: str) -> bool:
-        expected = hmac.new(self.key_secret.encode(), raw_body, sha256).hexdigest()
-        return hmac.compare_digest(expected, signature or "")
-
-    def verify_warlord_payment(self, user_id: str, order_id: str, payment_id: str, signature: str, subscription_id: str = "") -> dict:
-        reference_id = subscription_id or order_id
-        if not self.verify_signature(order_id, payment_id, signature, subscription_id=subscription_id):
-            self.record_transaction(user_id, reference_id, payment_id, "verification_failed", self.WARLORD_AMOUNT_PAISE)
-            raise RuntimeError("Razorpay payment verification failed")
-
-        now = datetime.now(timezone.utc)
-        period_end = now + timedelta(days=30)
-        status = "subscription_active" if subscription_id else "paid"
-        self.record_transaction(user_id, reference_id, payment_id, status, self.WARLORD_AMOUNT_PAISE)
-        self.upsert_user_plan(
-            user_id=user_id,
-            tier="Warlord",
-            weekly_limit=50,
-            billing_status="active",
-            current_period_start=now,
-            current_period_end=period_end,
-        )
-        return {
-            "tier": "Warlord",
-            "weekly_limit": 50,
-            "billing_status": "active",
-            "current_period_end": period_end.isoformat().replace("+00:00", "Z"),
-        }
-
-    def upsert_user_plan(self, user_id: str, tier: str, weekly_limit: int, billing_status: str, current_period_start: datetime | None = None, current_period_end: datetime | None = None):
-        payload = {
-            "user_id": user_id,
-            "tier": tier,
-            "weekly_limit": weekly_limit,
-            "billing_status": billing_status,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        if current_period_start:
-            payload["current_period_start"] = current_period_start.isoformat()
-        if current_period_end:
-            payload["current_period_end"] = current_period_end.isoformat()
-        return supabase_admin.table("user_plans").upsert(payload, on_conflict="user_id").execute()
-
-    def record_transaction(self, user_id: str, order_id: str, payment_id: str, status: str, amount: int):
+    def record_transaction(self, user_id: str, provider_reference: str, status: str, amount: int | None = None, currency: str = "INR"):
         try:
-            return supabase_admin.table("billing_transactions").insert({
+            payload = {
                 "user_id": user_id,
-                "provider": "razorpay",
-                "razorpay_order_id": order_id,
-                "razorpay_payment_id": payment_id,
+                "provider": "elixpo_pay",
                 "amount": amount,
-                "currency": self.currency,
+                "currency": currency,
                 "status": status,
                 "created_at": datetime.now(timezone.utc).isoformat(),
-            }).execute()
+                "provider_reference": provider_reference,
+            }
+            return supabase_admin.table("billing_transactions").insert(payload).execute()
         except Exception:
             return None
 
@@ -160,56 +103,82 @@ class BillingService:
                 "user_id": user_id,
                 "message": message,
                 "status": "open",
+                "provider": "elixpo_pay",
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }).execute()
         except Exception:
             pass
         return {"message": "Emperor custom pricing request recorded."}
 
-    def handle_webhook_event(self, payload: dict) -> dict:
-        event = payload.get("event", "")
-        entity = (
-            payload.get("payload", {})
-            .get("subscription", {})
-            .get("entity")
-        ) or (
-            payload.get("payload", {})
-            .get("payment", {})
-            .get("entity")
-        ) or {}
-        notes = entity.get("notes") or {}
-        user_id = notes.get("user_id")
-        if not user_id:
-            return {"handled": False, "reason": "missing_user_id"}
+    def activate_demo_warlord(self, user_id: str, activation_code: str) -> dict:
+        expected_code = os.getenv("DEMO_BILLING_PASSWORD", "")
+        if not expected_code or activation_code != expected_code:
+            raise RuntimeError("Invalid demo activation code")
 
-        if event in {"subscription.activated", "subscription.charged", "payment.captured"}:
-            now = datetime.now(timezone.utc)
-            self.upsert_user_plan(
-                user_id=user_id,
-                tier="Warlord",
-                weekly_limit=50,
-                billing_status="active",
-                current_period_start=now,
-                current_period_end=now + timedelta(days=30),
-            )
-            self.record_transaction(
-                user_id=user_id,
-                order_id=entity.get("subscription_id") or entity.get("order_id") or entity.get("id", ""),
-                payment_id=entity.get("id", ""),
-                status=event,
-                amount=int(entity.get("amount") or self.WARLORD_AMOUNT_PAISE),
-            )
-            return {"handled": True, "tier": "Warlord", "billing_status": "active"}
+        now = datetime.now(timezone.utc)
+        period_end = now + timedelta(days=30)
+        payload = {
+            "user_id": user_id,
+            "tier": "Warlord",
+            "weekly_limit": 50,
+            "billing_status": "active",
+            "monthly_price": 99,
+            "subscription_source": "elixpo_pay_demo",
+            "current_period_start": now.isoformat(),
+            "current_period_end": period_end.isoformat(),
+            "subscription_start_date": now.isoformat(),
+            "subscription_expiry_date": period_end.isoformat(),
+            "last_billed_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+        }
+        supabase_admin.table("user_plans").upsert(payload, on_conflict="user_id").execute()
+        self.record_transaction(
+            user_id=user_id,
+            provider_reference=f"demo_warlord_{int(now.timestamp())}",
+            status="demo_activated",
+            amount=9900,
+            currency="INR",
+        )
+        return {
+            "tier": "Warlord",
+            "weekly_limit": 50,
+            "billing_status": "active",
+            "current_period_end": period_end.isoformat().replace("+00:00", "Z"),
+            "message": "Demo Warlord entitlement activated.",
+        }
 
-        if event in {"subscription.cancelled", "subscription.halted"}:
-            plan = {
-                "user_id": user_id,
-                "tier": "Pirate",
-                "weekly_limit": 15,
-                "billing_status": "cancelled",
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-            supabase_admin.table("user_plans").upsert(plan, on_conflict="user_id").execute()
-            return {"handled": True, "tier": "Pirate", "billing_status": "cancelled"}
+    def _find_product(self, catalog: dict, tier: str) -> dict | None:
+        products = catalog.get("products") or catalog.get("data", {}).get("products") or []
+        for product in products:
+            if str(product.get("tier", "")).lower() == tier:
+                return product
+        return None
 
-        return {"handled": False, "reason": f"ignored_event:{event}"}
+    def _find_price(self, product: dict, region: str, recurring: bool) -> dict | None:
+        prices = product.get("prices") or []
+        preferred_type = "recurring" if recurring else "one_time"
+        for price in prices:
+            if price.get("type") == preferred_type and price.get("region", region) == region:
+                return price
+        for price in prices:
+            if price.get("region", region) == region:
+                return price
+        return prices[0] if prices else None
+
+    def _extract_checkout_url(self, product: dict, price: dict | None) -> str:
+        candidates = [
+            price or {},
+            product,
+        ]
+        for source in candidates:
+            for key in ("checkout_url", "payment_url", "url", "buy_url", "subscribe_url"):
+                value = source.get(key)
+                if isinstance(value, str) and value.startswith("http"):
+                    return value
+        return ""
+
+    def _fallback_product_url(self, tier: str, user_id: str) -> str:
+        base = self.product_page_url or f"{self.base_url}/products/{self.app_id}"
+        query = urlencode({"tier": tier, "user_id": user_id})
+        separator = "&" if "?" in base else "?"
+        return f"{base}{separator}{query}"

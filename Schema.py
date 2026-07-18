@@ -29,16 +29,20 @@ class QuotaStatusResponse(BaseModel):
     message: Optional[str] = ""
 
 
-class BillingOrderRequest(BaseModel):
+class BillingCheckoutRequest(BaseModel):
     user_id: str
+    tier: Optional[str] = "warlord"
+    region: Optional[str] = "IN"
+    recurring: Optional[bool] = True
 
 
-class BillingVerifyRequest(BaseModel):
+class BillingSyncRequest(BaseModel):
+    password: Optional[str] = ""
+
+
+class DemoEntitlementRequest(BaseModel):
     user_id: str
-    razorpay_order_id: Optional[str] = ""
-    razorpay_subscription_id: Optional[str] = ""
-    razorpay_payment_id: str
-    razorpay_signature: str
+    activation_code: str
 
 
 class EmperorRequest(BaseModel):

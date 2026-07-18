@@ -1,31 +1,33 @@
-# LogPose AI - Subscription & Billing System
+# LogPose AI - Elixpo Pay Billing System
 
-## Overview
-The billing system handles subscriptions, custom plans, and automated monthly invoice generation with PDF creation. It integrates tightly with the existing Quota system to limit user messaging capabilities based on their tier.
+Billing now uses Elixpo Pay catalog sync. Products and prices are declared in `payouts.catalog.json`, pushed to Elixpo Pay with a server secret, and read back from the public catalog for the frontend pricing page.
 
-## Tiers
+## Plans
+
 1. **Pirate**: Free tier. 15 messages/week.
-2. **Warlord**: Paid tier. Costs ₹99/month. 50 messages/week. Priority support.
-3. **Emperor**: Enterprise custom tier. Custom monthly price and custom message limit.
+2. **Warlord**: Paid tier. Rs. 99/month. 50 messages/week. Priority support.
+3. **Emperor**: Custom tier. Custom monthly price and custom message limit.
 
-## Database Tables
-### `user_plans`
-- **Updated Columns**: `monthly_price`, `custom_message_limit`, `subscription_source`, `patreon_email`, `subscription_started_at`, `subscription_expires_at`, `last_billed_at`.
-- Tracks the user's active tier, how much they pay, and their quota limit.
+## Catalog
 
-### `billing_invoices`
-- **Columns**: `id`, `user_id`, `invoice_number`, `tier`, `amount`, `message_limit`, `invoice_month`, `status`, `pdf_path`, `created_at`, `updated_at`.
-- Stores every monthly invoice generated. `pdf_path` points to a Supabase Storage bucket named `invoices`.
+- File: `payouts.catalog.json`
+- Sync script: `node scripts/sync-catalog.mjs`
+- Required env: `ELIXPO_PAY_API_KEY`
+- Optional env: `ELIXPO_PAY_BASE_URL`, `ELIXPO_PAY_APP_ID`, `ELIXPO_PAY_PRODUCT_PAGE_URL`, `ELIXPO_PAY_CATALOG_PATH`
+- Demo env: `DEMO_BILLING_PASSWORD`
 
-## Automated Invoicing (APScheduler)
-A background job runs on the **1st of every month at midnight (00:00)** to generate invoices.
-- **Service Method**: `billing_service.generate_monthly_invoices()`
-- It queries all active paid plans, uses ReportLab to generate a PDF, uploads it to Supabase storage, and inserts a `billing_invoices` record.
+Elixpo Pay sync returns HTTP 200 even when a product is rejected, so both the script and backend service inspect the response body and fail on `ok: false` or a non-empty `errors` array.
 
-## Admin Activation API
-Protected by `ADMIN_PLAN_PASSWORD` environment variable.
-- `POST /admin/activate-plan`: Sets a user's plan to any tier (typically Warlord).
-- `POST /admin/activate-emperor`: Sets a user's plan to Emperor with custom limits.
+## API Endpoints
 
-## Supabase Storage
-Ensure you have created a bucket named **`invoices`** in Supabase and made it public or restricted via policies. PDFs are saved at `invoices/YYYY/MM/<invoice_number>.pdf`.
+- `GET /billing/elixpo/catalog`: Reads the live public catalog from Elixpo Pay.
+- `POST /billing/elixpo/checkout`: Returns the best checkout/product handoff URL for a requested tier.
+- `POST /billing/elixpo/sync-catalog`: Admin-protected catalog sync using `ADMIN_PLAN_PASSWORD`.
+- `POST /billing/demo/activate-warlord`: Activates a local Warlord entitlement for demos when the correct `DEMO_BILLING_PASSWORD` is supplied.
+- `POST /billing/emperor/request`: Records a custom pricing request.
+
+## Entitlements
+
+The quota system still enforces access from the local `user_plans` table. When Elixpo Pay entitlement webhook details are available, webhook handling should update `user_plans` for grants, renewals, cancellations, and expirations.
+
+For portfolio and interview demos, `/billing/demo/activate-warlord` proves the entitlement path without requiring a real payment. It updates `user_plans`, records a demo transaction, and the quota endpoint immediately reports the Warlord limit.
